@@ -10,6 +10,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { filenameNeedsEmbedding } = require("../indexer/index-performance.js");
 const { loadCategoryOverrides } = require("./category-overrides.js");
 const {
 	getModel,
@@ -1248,7 +1249,7 @@ function planDeltaReuse(modelId, dim, filenames) {
 		}
 		const e = embedRows[j];
 		const p = phraseRows[j];
-		if (!e || !p || isZeroVector(e) || isZeroVector(p)) {
+		if (!e || !p || isZeroVector(e) || (isZeroVector(p) && filenameNeedsEmbedding(filenames[i]))) {
 			missing.push(filenames[i]);
 			continue;
 		}

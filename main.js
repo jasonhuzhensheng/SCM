@@ -31,6 +31,7 @@ const {
 	SAMPLE_QUERIES,
 	buildFilenamePhrase,
 } = require("./indexer/memory-embedding-utils.js");
+const { filenameNeedsEmbedding, createCheckpointGate } = require("./indexer/index-performance.js");
 const { sortPathsByMtime } = require("./indexer/import-order-utils.js");
 const {
 	SEGMENT_ROW_PER,
@@ -182,12 +183,11 @@ const youtube = require("./main-lib/youtube.js");
 
 const SCHEME = "app";
 
-// Test isolation: point the whole app (library, models, single-instance
-// lock) at a scratch dir. Must happen before the lock/ready paths resolve
-// any app paths.
-if (process.env.MEMORIES_DATA_DIR) {
-	app.setPath("userData", process.env.MEMORIES_DATA_DIR);
-}
+// Keep the existing library, caches and single-instance lock when the display
+// name changes. Tests can still isolate all state in a scratch directory.
+app.setPath("userData", process.env.MEMORIES_DATA_DIR || path.join(app.getPath("appData"), "scm"));
+app.setName("big2 photo");
+app.setAboutPanelOptions({ applicationName: "big2 photo" });
 
 // ---------------------------------------------------------------------------
 // Persistent file logging: the packaged app's stdout goes nowhere on macOS,
@@ -253,7 +253,7 @@ function initFileLogging() {
 				}
 			};
 		}
-		stream.write(`${stamp()} [log] --- SCM start (pid ${process.pid}) ---\n`);
+		stream.write(`${stamp()} [log] --- big2 photo start (pid ${process.pid}) ---\n`);
 	} catch {
 		/* file logging unavailable; console still works */
 	}
@@ -342,9 +342,41 @@ ipcMain.handle("memories:drive-configure", () => driveReply(async () => {
 }));
 ipcMain.handle("memories:drive-login", () => driveReply(async () => { if (driveTransfer) throw new Error("请等待上传完成。"); return drive.login(); }));
 ipcMain.handle("memories:drive-disconnect", () => driveReply(async () => { if (driveTransfer) throw new Error("请等待上传完成。"); return drive.disconnect(); }));
+let detectionIndex = null;
+let detectionStartTimer = null;
+function getDetectionIndex() {
+ if (!detectionIndex) {
+  detectionIndex = require("./main-lib/detection-index.js").createDetectionIndex({
+   directory: PHOTOS_DIR, databasePath: path.join(DATA_DIR, "image-detections.sqlite"),
+   binary: app.isPackaged ? path.join(process.resourcesPath, "qr-detector") : path.join(__dirname, "main-lib/native/qr-detector"),
+   libraryRows: () => { const l=loadLibrary(); return l.filenames.map((name,i)=>({name,text:l.ocr?.[i] ?? null})); },
+   foregroundBusy: () => importInFlight || !!migrationState || startupModelPending,
+   isImage: name => !VIDEO_EXTENSIONS.has(path.extname(name).toLowerCase()),
+  });
+  detectionIndex.start();
+ }
+ return detectionIndex;
+}
+ipcMain.handle("memories:detection-search", (_event, kind, query) => {
+ try { if (typeof query !== "string" || query.length > 1000) throw new Error("无效查询"); return {ok:true,...getDetectionIndex().search(kind,query)}; }
+ catch (error) { return {ok:false,error:error.message}; }
+});
+ipcMain.handle("memories:detection-pause", (_event, paused) => {
+ try { if(typeof paused!=="boolean")throw new Error("无效请求");return {ok:true,status:getDetectionIndex().setPaused(paused)}; }
+ catch(error){return {ok:false,error:error.message};}
+});
+// Compatibility: old renderers read indexed hits without launching scans.
+ipcMain.handle("memories:qr-scan", (_event, names, kind="qr") => {
+ try { if(!Array.isArray(names))throw new Error("无效请求");const wanted=new Set(names);return {ok:true,...getDetectionIndex().search(kind),filenames:getDetectionIndex().search(kind).filenames.filter(name=>wanted.has(name))}; }
+ catch(error){return {ok:false,error:error.message};}
+});
 ipcMain.handle("memories:drive-cancel", () => { driveTransfer?.abort(); return { ok: true }; });
 ipcMain.handle("memories:drive-transfer", (event, options) => driveReply(async () => {
-	if (driveTransfer || importInFlight || migrationState) throw new Error("请等待当前导入、索引切换或上传结束。");
+	if (driveTransfer) throw new Error("正在传输或删除文件，请等待当前操作结束。");
+	if (migrationState) throw new Error("正在切换搜索模型，请等待索引切换完成后重试。");
+	// Only committed library rows can be selected below. Imports append complete
+	// rows synchronously, and removal resolves the current row by filename, just
+	// like memories:delete. An unrelated import batch must not block transfers.
 	const localFolder = options?.destination === "folder";
  const destination = localFolder && selectedTransferFolder?.token === options.folderToken ? selectedTransferFolder.directory : null;
  if (localFolder && !destination) throw new Error("请重新选择目标文件夹。");
@@ -353,13 +385,13 @@ ipcMain.handle("memories:drive-transfer", (event, options) => driveReply(async (
 	const names = [...new Set(options.filenames)];
 	const l = loadLibrary();
 	if (!names.length || names.length > 10000 || names.some(name => typeof name !== "string" || path.basename(name) !== name || !l.filenames.includes(name))) throw new Error("选择包含无效素材，请重新选择。");
-	const folderName = String(options.folderName || "SCM 搜索结果").trim().slice(0, 160);
+	const folderName = String(options.folderName || "big2 photo 搜索结果").trim().slice(0, 160);
 	const controller = new AbortController(); driveTransfer = controller;
 	const results = []; let folder;
 	const emit = payload => { if (!event.sender.isDestroyed()) event.sender.send("memories:drive-progress", payload); };
 	try {
 		folder = localFolder
-   ? { localPath: await fs.promises.mkdtemp(path.join(destination, "SCM 搜索结果-")) }
+   ? { localPath: await fs.promises.mkdtemp(path.join(destination, "big2 photo 搜索结果-")) }
    : await drive.createFolder(folderName, controller.signal);
 		for (const filename of names) {
 			if (controller.signal.aborted) break;
@@ -485,6 +517,13 @@ const readPhotoLocations = require("./main-lib/photo-location.js").createLocatio
  metadata: file => require("sharp")(file).metadata(),
 });
 const loadMapTile = require("./main-lib/map-tiles.js").createTileLoader(path.join(DATA_DIR, "map-tiles"));
+ipcMain.handle("memories:file-sizes", async (_event, names) => {
+ if (!Array.isArray(names) || names.length > 100 || names.some(name => typeof name !== "string" || path.basename(name) !== name)) throw new Error("Invalid file size batch");
+ const known = new Set(loadLibrary().filenames);
+ const files = [...new Set(names)].filter(name => known.has(name));
+ const stats = await require("./indexer/index-performance.js").readStats(files, name => fs.promises.stat(path.join(PHOTOS_DIR, name)));
+ return files.map(filename => ({ filename, size: stats.get(filename)?.isFile() ? stats.get(filename).size : null }));
+});
 ipcMain.handle("memories:photo-locations", async (_event, names) => {
  if (!Array.isArray(names) || names.length > 50 || names.some(n => typeof n !== "string")) throw new Error("Invalid location batch");
  const known = new Set(loadLibrary().filenames);
@@ -817,7 +856,8 @@ async function healPhraseBin() {
 				dot += ph[k] * (im[k] || 0);
 				norm += ph[k] * ph[k];
 			}
-			if (norm < 1e-6 || dot > 0.9999) corrupt.push(l.filenames[i]);
+			// Zero is intentional for UUID/hash names; do not re-encode on restart.
+			if ((norm < 1e-6 && filenameNeedsEmbedding(l.filenames[i])) || dot > 0.9999) corrupt.push(l.filenames[i]);
 		}
 	}
 	if (corrupt.length === 0) return { healed: 0, attempted: 0 };
@@ -1645,19 +1685,16 @@ async function preloadAllModels() {
 // A background delta tail (kind "fill") is the exception: a new switch
 // cancels it (generation bump — its checkpoints stay on disk and the next
 // delta resumes them) and proceeds.
+const { createLiveSearchIndex } = require("./main-lib/live-search-index.js");
 let migrationState = null;
 let migrationFillGeneration = 0;
 
-// How often (rows) a running migration writes the target's bins to disk.
-const MIGRATE_CHECKPOINT = 25;
+// Migration checkpoints scale with the batch (see createCheckpointGate).
 
 // The file a row's embedding was computed from at import. The recorded
 // source may have moved away; the app-managed copy is the fallback.
 function rowSourcePath(i) {
-	const l = loadLibrary();
-	const source = l.sources && l.sources[i];
-	if (source && fs.existsSync(source)) return source;
-	return path.join(PHOTOS_DIR, l.filenames[i]);
+	return rowSourcePathAt(loadLibrary(), i);
 }
 
 // Re-embed every row of the library into `targetId`'s model. Resolves to
@@ -1665,7 +1702,7 @@ function rowSourcePath(i) {
 // is broadcast as { type: "migrate", phase, done, total, modelId }.
 // Bounded-concurrency pump, sized like the import pipeline (pool×2).
 const MIGRATE_CONCURRENCY = Math.max(2, INDEXER_POOL_SIZE * 2);
-async function reembedToModel(targetId) {
+async function reembedToModel(targetId, { requireComplete = false } = {}) {
 	if (driveTransfer) throw new Error("请等待 Google Drive 上传完成。");
 	const target = getModel(targetId);
 	if (!target) throw new Error(`Unknown model: ${targetId}`);
@@ -1760,6 +1797,7 @@ async function reembedToModel(targetId) {
 	if (
 		existing &&
 		existing.rows === l.filenames.length &&
+		!readEmbedMeta(targetId)?.incomplete &&
 		existing.dim === dim
 	) {
 		const embeddings = readBin(embedFileFor(targetId), l.filenames.length, dim);
@@ -1771,7 +1809,8 @@ async function reembedToModel(targetId) {
 		// rebuilds and heals) instead.
 		if (
 			embeddings.length === l.filenames.length &&
-			phrases.length === l.filenames.length
+			phrases.length === l.filenames.length &&
+			(!requireComplete || embeddings.every(v => !isZeroVector(v)))
 		) {
 			let textMean = null;
 			try {
@@ -1824,7 +1863,7 @@ async function reembedToModel(targetId) {
 	// to the foreground slow path when there is nothing reusable (first
 	// switch, pipeline change, or unreadable bins).
 	const delta = planDeltaReuse(targetId, dim, [...l.filenames]);
-	if (delta.usable && delta.reused > 0) {
+	if (!requireComplete && delta.usable && delta.reused > 0) {
 		return flipWithBackgroundFill(targetId, dim, delta, broadcast, total);
 	}
 
@@ -1836,12 +1875,18 @@ async function reembedToModel(targetId) {
 	// misalign vectors.
 	const rowCount = l.filenames.length;
 	const rowFilenames = [...l.filenames];
+	const shouldCheckpoint = createCheckpointGate(rowCount);
 	// Dense from the start: checkpointed writeBins mid-migration must never
 	// see sparse holes (.map skips holes, so Buffer.concat would throw on
 	// the unwritten tail). Unwritten rows read as zero vectors until their
 	// reply lands — same contract as failed rows below.
-	const newEmbeddings = new Array(rowCount).fill(null);
-	const newPhrases = new Array(rowCount).fill(null);
+	const reuse = requireComplete && delta.usable;
+	const newEmbeddings = reuse ? delta.reusedEmbeddings : new Array(rowCount).fill(null);
+	const newPhrases = reuse ? delta.reusedPhrases : new Array(rowCount).fill(null);
+	const jobs = Array.from({ length: rowCount }, (_, i) => i).filter(i => !newEmbeddings[i]);
+	migrationState.done = rowCount - jobs.length;
+	migrationState.search = createLiveSearchIndex(targetId, dim, rowCount).seed(l, newEmbeddings, newPhrases);
+	let abortReason = null;
 	const failures = [];
 	let next = 0;
 	let inFlight = 0;
@@ -1852,8 +1897,8 @@ async function reembedToModel(targetId) {
 
 	await new Promise((resolveBatch) => {
 		const pump = () => {
-			while (inFlight < MIGRATE_CONCURRENCY && next < rowCount) {
-				const i = next++;
+			while (!abortReason && inFlight < MIGRATE_CONCURRENCY && next < jobs.length) {
+				const i = jobs[next++];
 				inFlight++;
 				(async () => {
 					try {
@@ -1874,6 +1919,7 @@ async function reembedToModel(targetId) {
 						if (reply.vec && reply.vec.length === dim) {
 							newEmbeddings[i] = new Float32Array(reply.vec);
 						} else {
+							if (requireComplete) throw new Error("Empty or wrong-dim vector");
 							failures.push(`${filename}: empty or wrong-dim vector`);
 							newEmbeddings[i] = new Float32Array(dim);
 						}
@@ -1885,12 +1931,15 @@ async function reembedToModel(targetId) {
 							}
 							newPhrases[i] = new Float32Array(dim);
 						}
+						migrationState.search.append(filename, newEmbeddings[i], newPhrases[i], l.ocrWords?.[i]);
 					} catch (err) {
 						failures.push(`${l.filenames[i]}: ${err.message}`);
+						console.warn(`[memories] migration row ${i} failed: ${err.message}`);
+						if (requireComplete) abortReason = err;
 					} finally {
 						inFlight--;
 						migrationState.done++;
-						if (migrationState.done % MIGRATE_CHECKPOINT === 0) {
+						if (shouldCheckpoint(migrationState.done)) {
 							void writeBins(targetId, newEmbeddings, newPhrases, dim, dim, {
 								filenames: rowFilenames,
 								incomplete: true,
@@ -1898,16 +1947,22 @@ async function reembedToModel(targetId) {
 						}
 						broadcast("embedding");
 						pump();
-						if (migrationState.done >= rowCount && inFlight === 0) {
+						if ((abortReason || migrationState.done >= rowCount) && inFlight === 0) {
 							resolveBatch();
 						}
 					}
 				})();
 			}
+			if (next >= jobs.length && inFlight === 0) resolveBatch();
 		};
 		pump();
 	});
 
+	if (abortReason) {
+		await writeBins(targetId, newEmbeddings, newPhrases, dim, dim, { filenames: rowFilenames, incomplete: true });
+		stopIndexerPool(); workerModelId = null; migrationState = null;
+		throw new Error(`Model conversion stopped; original index preserved: ${abortReason.message}`);
+	}
 	if (failures.length === rowCount) {
 		// Same as the model-load failure: never leave a pool forked for the
 		// target model behind a library that still names the old one.
@@ -2049,6 +2104,7 @@ async function flipWithBackgroundFill(targetId, dim, delta, broadcast, total) {
 		done: delta.reused,
 		total,
 		kind: "fill",
+		search: createLiveSearchIndex(l.modelId, l.dim, l.filenames.length).seed(l),
 		gen,
 	};
 	broadcast("embedding");
@@ -2074,6 +2130,7 @@ async function flipWithBackgroundFill(targetId, dim, delta, broadcast, total) {
 // can't misalign vectors. Rows that gained real vectors meanwhile (an import
 // embedding through the active pool) are skipped, never clobbered.
 async function runDeltaFill(targetId, dim, missing, gen, broadcast) {
+	const shouldCheckpoint = createCheckpointGate(missing.length);
 	const failures = [];
 	let next = 0;
 	let inFlight = 0;
@@ -2119,6 +2176,7 @@ async function runDeltaFill(targetId, dim, missing, gen, broadcast) {
 							}
 							after.phrases[at] = new Float32Array(dim);
 						}
+						migrationState.search?.append(filename, after.embeddings[at], after.phrases[at], after.ocrWords?.[at]);
 					} catch (err) {
 						if (alive()) failures.push(`${filename}: ${err.message}`);
 					} finally {
@@ -2129,7 +2187,7 @@ async function runDeltaFill(targetId, dim, missing, gen, broadcast) {
 					} else {
 						done++;
 						if (migrationState) migrationState.done++;
-						if (done % MIGRATE_CHECKPOINT === 0) {
+						if (shouldCheckpoint(done)) {
 							const snap = loadLibrary();
 							void writeBins(
 								targetId,
@@ -2206,9 +2264,13 @@ function migrationSettled() {
 // rowSourcePath for a live library snapshot + resolved index (the delta fill
 // re-resolves indices by filename, so it can't use the index-based helper).
 function rowSourcePathAt(lib, idx) {
+	// Re-embed the app's own stored asset. External/cloud originals may no
+	// longer be readable after their picker permission or mount expires.
+	const managed = path.join(PHOTOS_DIR, lib.filenames[idx]);
+	if (fs.existsSync(managed)) return managed;
 	const source = lib.sources && lib.sources[idx];
 	if (source && fs.existsSync(source)) return source;
-	return path.join(PHOTOS_DIR, lib.filenames[idx]);
+	return managed;
 }
 
 // Launch resume: a previous run quit (or crashed) mid-fill, leaving
@@ -2256,6 +2318,7 @@ async function maybeResumeDeltaFill() {
 		done: delta.reused,
 		total: l.filenames.length,
 		kind: "fill",
+		search: createLiveSearchIndex(l.modelId, l.dim, l.filenames.length).seed(l),
 		gen,
 	};
 	console.log(
@@ -2390,15 +2453,19 @@ async function expandMediaPaths(paths) {
 	return out;
 }
 
+const nameCursors = new WeakMap();
 function uniqueName(base, taken) {
+	let cursors = nameCursors.get(taken);
+	if (!cursors) { cursors = new Map(); nameCursors.set(taken, cursors); }
 	const ext = path.extname(base);
 	const stem = path.basename(base, ext);
 	let candidate = base;
-	let n = 2;
+	let n = cursors.get(base) || 2;
 	while (taken.has(candidate)) {
 		candidate = `${stem} (${n})${ext}`;
 		n++;
 	}
+	cursors.set(base, n);
 	taken.add(candidate);
 	return candidate;
 }
@@ -2537,11 +2604,15 @@ ipcMain.handle(
 // a second batch is refused too (uniqueName dedupe and the ordered flush
 // assume one writer at a time).
 let importInFlight = false;
+let importSearch = null;
+let importSearchTotal = 0;
+let startupModelPending = false;
 
 // `fromWatch` marks a watched-folder sync (launch / poll / live fs event).
 // The import-failure cache is only consulted for these: a manual re-import is
 // the user explicitly asking for a fresh attempt, so it always runs.
 async function importPaths(rawPaths, { fromWatch = false } = {}) {
+	if (startupModelPending) return { added: [], skipped: [], errors: [{ file: "", error: "正在准备快速索引模型，请稍后重试。" }], watched: [] };
 	if (driveTransfer) return { added: [], skipped: [], errors: [{ file: "", error: "请等待 Google Drive 上传完成。" }], watched: [] };
 	// A model migration re-embeds the whole library and pins the worker
 	// pool to the target model. Rows imported mid-migration would be
@@ -2580,6 +2651,7 @@ async function importPaths(rawPaths, { fromWatch = false } = {}) {
 		};
 	}
 	importInFlight = true;
+	importSearchTotal = loadLibrary().filenames.length;
 	updateTrayState();
 	let result;
 	try {
@@ -2591,6 +2663,7 @@ async function importPaths(rawPaths, { fromWatch = false } = {}) {
 		throw error;
 	} finally {
 		importInFlight = false;
+		importSearch = null;
 		updateTrayState();
 	}
 	// Hidden-window completion note (watched-folder syncs with nothing new
@@ -2713,6 +2786,8 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	// embed → video frames/poster). `done` = files completed IN ORDER before
 	// the current one, so the bar shows done+1/total while it's in flight.
 	const total = uniquePaths.length;
+	importSearchTotal = l.filenames.length + total;
+	if (importSearch) importSearch.total = importSearchTotal;
 	// Scale the checkpoint with batch size: a large import (3000 rows)
 	// checkpoints every 25 rows = 120 saves, each encoding the full
 	// growing bin pair (~18 MB at row 3000). Target ~20 checkpoints
@@ -2791,6 +2866,7 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			? new Float32Array(outcome.reply.phrase)
 			: new Float32Array(outcome.reply.vec.length);
 		l.phrases.push(phraseVec);
+		importSearch?.append(outcome.filename, l.embeddings[l.embeddings.length - 1], phraseVec);
 		// Persist periodically instead of after every file (see the
 		// checkpoint note above); the final save happens at batch end.
 		if (++sinceCheckpoint >= CHECKPOINT_INTERVAL) {
@@ -2798,6 +2874,7 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			void saveLibrary();
 		}
 		result.added.push(outcome.filename);
+		try { if (typeof detectionIndex !== "undefined") detectionIndex?.add({name:outcome.filename,text:null}); } catch (error) { console.warn("[detection-index] import:",error.message); }
 	};
 
 	const flushResults = () => {
@@ -5008,6 +5085,7 @@ async function pumpOcr() {
 			if (!l.ocr) l.ocr = [];
 			if (!l.ocrWords) l.ocrWords = [];
 			l.ocr[idx] = reply.text;
+			try { if (typeof detectionIndex !== "undefined") detectionIndex?.setText(filename, reply.text); } catch (error) { console.warn("[detection-index] OCR:",error.message); }
 			l.ocrWords[idx] = Array.isArray(reply.words) ? reply.words : [];
 			l.ocrRevision = (l.ocrRevision || 0) + 1;
 			// Adopt the language stamp on first OCR (fresh installs have no
@@ -5833,7 +5911,7 @@ function createWindow({ showOnReady = true } = {}) {
 		show: false,
 		fullscreen: false,
 		fullscreenable: true,
-		title: "SCM",
+		title: "big2 photo",
 		icon: APP_ICON || undefined,
 		webPreferences: WEB_PREFERENCES,
 	});
@@ -5968,6 +6046,7 @@ function ensureRankWorker() {
 
 function askRankWorker(message) {
 	const worker = ensureRankWorker();
+	if (message.type === "rank") worker.liveId = null;
 	return new Promise((resolve, reject) => {
 		const id = `k${++rankRequestId}`;
 		const timer = setTimeout(() => {
@@ -6008,25 +6087,18 @@ function stopRankWorker() {
 }
 
 // Embed the query through the indexer (unless a caller supplied qVec).
-// Returns Float32Array or null (model down / migration / embed failure).
+// Unavailable search throws so the UI never presents it as a real no-match.
 async function embedRankQuery(trimmed, dim) {
-	trimmed = await translateSearchQuery(trimmed);
-	try {
-		spawnIndexer();
-		await indexerReady;
-	} catch {
-		return null;
-	}
-	if (migrationState) return null;
-	try {
-		const reply = await askIndexer({ type: "embed-query", text: trimmed });
-		if (reply.vec && reply.vec.length === dim) {
-			return new Float32Array(reply.vec);
-		}
-	} catch {
-		return null;
-	}
-	return null;
+ if (migrationState || startupModelPending) throw new Error("正在更新搜索索引，画面搜索暂不可用。更新完成后请重新搜索；这不代表素材库中没有匹配图片。");
+ trimmed = await translateSearchQuery(trimmed);
+ try { spawnIndexer(); await indexerReady; }
+ catch { throw new Error("画面搜索模型暂未就绪，请稍后重试。"); }
+ if (migrationState || startupModelPending) throw new Error("正在更新搜索索引，请等待更新完成后重试。");
+ try {
+  const reply = await askIndexer({ type: "embed-query", text: trimmed });
+  if (reply.vec && reply.vec.length === dim) return new Float32Array(reply.vec);
+ } catch { throw new Error("画面搜索模型暂未就绪，请稍后重试。"); }
+ throw new Error("画面搜索未能生成有效查询，请重试。");
 }
 
 // Score against the in-process library (tests / fallback). qVecOverride
@@ -6050,6 +6122,36 @@ async function rankSearch(queryText, topK, qVecOverride) {
 	return scoreLibrary(l, trimmed, qVec, topK, thresholds, norms);
 }
 
+// Send only newly completed rows to the rank worker. A new worker or a new
+// migration starts a fresh snapshot; the target vectors never enter old bins.
+async function rankPartialSearch(queryText, topK) {
+ if (!migrationState && importInFlight && !importSearch) {
+  await indexerReady;
+  const library = loadLibrary();
+  importSearch = createLiveSearchIndex(library.modelId, library.dim || getModel(library.modelId).dim, importSearchTotal).seed(library);
+ }
+ const live = migrationState?.search || (importInFlight ? importSearch : null);
+ if (!live) throw new Error("正在准备搜索模型，已处理的图片很快即可搜索，请稍后重试。");
+ const isCurrent = () => poolModelId() === live.modelId &&
+  (migrationState?.search === live || (!migrationState && loadLibrary().modelId === live.modelId));
+ const text = await translateSearchQuery(queryText);
+ if (!isCurrent()) throw new Error("搜索模型正在切换，请重试。");
+ const reply = await askIndexer({ type: "embed-query", text });
+ if (!isCurrent() || !reply.vec || reply.vec.length !== live.dim) throw new Error("搜索模型正在切换，请重试。");
+ const count = live.rows.length;
+ const worker = ensureRankWorker();
+ const offset = worker.liveId === live.id ? worker.liveCount : 0;
+ const work = askRankWorker({ type: "rank-live", query: queryText, topK, qVec: reply.vec,
+  live: { id: live.id, modelId: live.modelId, dim: live.dim, total: live.total, offset, rows: live.rows.slice(offset, count) } });
+ worker.liveId = live.id; worker.liveCount = count;
+ let results;
+ try { results = await work; }
+ catch (error) { worker.liveId = null; throw error; }
+ if (!isCurrent()) throw new Error("搜索模型正在切换，请重试。");
+ // Do not expose target query vectors to the renderer's old scene index/cache.
+ return { results, queryVec: null, partial: true, indexed: count, total: live.total, modelId: live.modelId };
+}
+
 // Single-round-trip variant (M-11): the centered query vector rides ALONGSIDE
 // the results so scene/transcript fusion never re-embeds. The return is
 // ALWAYS an array (backward compatible with every existing consumer: perf
@@ -6060,6 +6162,7 @@ async function rankSearch(queryText, topK, qVecOverride) {
 // Production scoring runs in the rank utilityProcess (Phase 0.4); on worker
 // failure this falls back to the in-process rankSearch path.
 async function rankSearchWithVec(queryText, topK, qVecOverride) {
+	if ((migrationState || importInFlight) && String(queryText || "").trim()) return rankPartialSearch(String(queryText).trim(), topK || 96);
 	const withVec = (results, queryVec) => attachQueryVec(results, queryVec);
 	const trimmed = (queryText || "").trim();
 	if (!trimmed) return withVec([], null);
@@ -6105,11 +6208,7 @@ ipcMain.handle("memories:similar-photos", async (_event, filename) => {
 });
 
 ipcMain.handle("memories:rank", async (_event, query, topK) => {
-	try {
-		return await rankSearchWithVec(query, topK || 96);
-	} catch {
-		return [];
-	}
+	return rankSearchWithVec(query, topK || 96);
 });
 
 // ---------------------------------------------------------------------------
@@ -6346,6 +6445,22 @@ ipcMain.handle("memories:import-paths", async (_event, paths) => {
 
 ipcMain.handle("memories:pick", async () => pickAndImport());
 
+let applePhotos;
+function getApplePhotos() {
+ if (!applePhotos) applePhotos = require("./main-lib/apple-photos.js").createApplePhotos({
+  directory: DATA_DIR,
+  executable: app.isPackaged ? path.join(process.resourcesPath, "apple-photos-bridge") : path.join(__dirname, "main-lib/native/apple-photos-bridge"),
+  importFiles: paths => importPaths(paths),
+  busy: () => isQuitting || startupModelPending || !!migrationState || importInFlight || !!driveTransfer,
+ });
+ return applePhotos;
+}
+ipcMain.handle("memories:apple-photos-status", () => getApplePhotos().snapshot());
+ipcMain.handle("memories:apple-photos-connect", () => getApplePhotos().connect());
+ipcMain.handle("memories:apple-photos-pause", () => getApplePhotos().pause());
+ipcMain.handle("memories:apple-photos-sync", () => { void getApplePhotos().sync(); return getApplePhotos().snapshot(); });
+
+
 ipcMain.handle("memories:get-watched-folders", () => watchedFolderList());
 
 // N-06: renderer-visible app version (Settings footer). app.getVersion()
@@ -6494,6 +6609,7 @@ function removeLibraryRow(filename) {
 	}
 	// Splice every parallel array together so bins stay 1:1 with filenames.
 	l.filenames.splice(idx, 1);
+	try { if (typeof detectionIndex !== "undefined") detectionIndex?.remove(filename); } catch (error) { console.warn("[detection-index] remove:",error.message); }
 	l.sources.splice(idx, 1);
 	if (l.sourceMtimes) l.sourceMtimes.splice(idx, 1);
 	if (l.ocr) l.ocr.splice(idx, 1);
@@ -6909,7 +7025,7 @@ function trayStatusLines() {
 function buildTrayMenu() {
 	const template = [
 		{
-			label: "Open SCM",
+			label: "打开big2 photo",
 			click: () => showAndFocusMain(),
 		},
 		{
@@ -6938,7 +7054,7 @@ function buildTrayMenu() {
 	}
 	if (statusLines.length > 0) template.push({ type: "separator" });
 	template.push({
-		label: "Quit SCM",
+		label: "退出big2 photo",
 		click: () => {
 			isQuitting = true;
 			app.quit();
@@ -6955,7 +7071,7 @@ function createTray() {
 		return;
 	}
 	tray = new Tray(icon);
-	tray.setToolTip("SCM");
+	tray.setToolTip("big2 photo");
 	// Deliberately NO setContextMenu: on macOS an attached menu hijacks
 	// left-click. Left-click toggles the window; right-click pops a menu
 	// built fresh at open time so the status lines are never stale.
@@ -9475,7 +9591,11 @@ if (!gotTheLock) {
 		})();
 	}
 	app.whenReady().then(async () => {
+        setTimeout(() => { if (!isQuitting) getApplePhotos().start(); }, 15000).unref();
+		detectionStartTimer = setTimeout(() => { try { getDetectionIndex(); } catch (error) { console.warn("[detection-index] startup:", error.message); } }, 3000);
+		detectionStartTimer.unref();
 		loadLibrary();
+		startupModelPending = !!getModel(readSettings().requestedIndexModel);
 		// Remove library rows whose photo files no longer exist on disk
 		// (manual deletion, crash mid-dedupe, unwatched folder). Runs
 		// before backfills so ghost entries don't waste OCR/enrichment work.
@@ -9542,7 +9662,6 @@ if (!gotTheLock) {
 		// Watch folders the user imported in past sessions: their live
 		// watchers + safety-net poll start here, and the first sync runs
 		// below once the indexer is ready.
-		startWatchedFolderWatchers();
 
 		const win = createWindow({
 			// "Start hidden" (menu-bar-only mode): boot straight to the tray
@@ -9554,6 +9673,27 @@ if (!gotTheLock) {
 		console.log("[app] loading renderer…");
 		await win.loadURL(`${SCHEME}://localhost/`);
 		console.log("[app] renderer loaded");
+        // LaunchServices establishes this app as the TCC responsible process.
+        // This flag is used only by an explicit user-requested connection launch.
+        if (process.argv.includes("--connect-apple-photos")) {
+            void getApplePhotos().connect().catch(error => console.warn("[apple-photos] connection:", error.message));
+        }
+
+		// A user-requested speed-mode switch must finish before folder imports.
+		// Reuse the checkpointed migration; never relabel existing vectors.
+		if (startupModelPending) {
+			try {
+				await indexerReady;
+				await migratePendingModel();
+				await require("./main-lib/index-startup.js").applyRequestedIndexModel({
+					readSettings, writeSettings, getModel, reembedToModel, migrationSettled,
+				});
+			} catch (error) {
+				console.warn(`[memories] requested model switch deferred: ${error.message}`);
+				if (!isQuitting) dialog.showErrorBox("快速索引模型切换未完成", `${error.message}\n原有索引已保留，下次启动将重试。`);
+			} finally { startupModelPending = false; }
+		}
+		startWatchedFolderWatchers();
 
 		// MobileCLIP2-S2 (and any pre-registry model id) is retired. The
 		// loader holds its persisted vectors aside rather than resolving them
@@ -10010,6 +10150,35 @@ if (!gotTheLock) {
 			return;
 		}
 
+        if (process.env.ELECTRON_SMOKE_APPLE_PHOTOS === "1") {
+            try {
+                const snapshot = await win.webContents.executeJavaScript("window.memories.applePhotosStatus()");
+                if (!snapshot.supported || snapshot.enabled) throw new Error("Expected a supported, disconnected fixture");
+                let controls = false;
+                for (let attempt = 0; attempt < 40 && !controls; attempt++) {
+                    controls = await win.webContents.executeJavaScript("document.body.innerText.includes('连接整个照片图库')");
+                    if (!controls) await new Promise(resolve => setTimeout(resolve, 250));
+                }
+                if (!controls) throw new Error("Photos connection control missing");
+                const { execFileSync } = require("node:child_process");
+                const response = JSON.parse(execFileSync(path.join(process.resourcesPath, "apple-photos-bridge"), [], { input: JSON.stringify({ mode: "ping" }), encoding: "utf8" }));
+                if (!response.ok) throw new Error("Native bridge failed");
+                console.log("[apple-photos-smoke] OK: renderer control, preload IPC, disconnected status, native bridge");
+            } catch (error) { console.error("[apple-photos-smoke] FAILED", error); process.exitCode = 1; }
+            quitSmoke(); return;
+        }
+
+		if (process.env.ELECTRON_SMOKE_LIVE_SEARCH === "1") {
+			try {
+				await require("./scripts/e2e/live-search.js").runLiveSearchSmoke({
+					win, importPaths, reembedToModel, loadLibrary,
+					getMigration: () => migrationState,
+					getImporting: () => importInFlight,
+				});
+			} catch (error) { console.error("[live-search-smoke] FAILED", error); process.exitCode = 1; }
+			quitSmoke(); return;
+		}
+
 		if (process.env.ELECTRON_SMOKE === "1") {
 			try {
 				console.log("[smoke] step: title");
@@ -10157,6 +10326,7 @@ if (!gotTheLock) {
 	// down the close-to-tray handler so the window is allowed to close.
 	app.on("before-quit", () => {
 		driveTransfer?.abort();
+        applePhotos?.stop();
 		isQuitting = true;
 	});
 
@@ -10204,6 +10374,8 @@ if (!gotTheLock) {
 	});
 
 	function runWillQuitCleanup() {
+		clearTimeout(detectionStartTimer);
+		detectionIndex?.close();
 		unregisterCurrentShortcut();
 		// Stop the watched-folder watchers + poll.
 		stopWatchedFolderWatchers();

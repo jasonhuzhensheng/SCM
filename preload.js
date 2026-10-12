@@ -3,6 +3,10 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("memories", {
+	detectionSearch: (kind, query = "") => ipcRenderer.invoke("memories:detection-search", kind, query),
+	detectionPause: (paused) => ipcRenderer.invoke("memories:detection-pause", paused),
+	qrScan: (names, kind) => ipcRenderer.invoke("memories:qr-scan", names, kind),
+	fileSizes: (names) => ipcRenderer.invoke("memories:file-sizes", names),
 	photoLocations: (names) => ipcRenderer.invoke("memories:photo-locations", names),
 	pickTransferFolder: () => ipcRenderer.invoke("memories:pick-transfer-folder"),
 	driveStatus: () => ipcRenderer.invoke("memories:drive-status"),
@@ -23,6 +27,10 @@ contextBridge.exposeInMainWorld("memories", {
 	getTranscribeState: () => ipcRenderer.invoke("memories:transcribe-state"),
 	importPaths: (paths) => ipcRenderer.invoke("memories:import-paths", paths),
 	pickPhotos: () => ipcRenderer.invoke("memories:pick"),
+ applePhotosStatus: () => ipcRenderer.invoke("memories:apple-photos-status"),
+ applePhotosConnect: () => ipcRenderer.invoke("memories:apple-photos-connect"),
+ applePhotosPause: () => ipcRenderer.invoke("memories:apple-photos-pause"),
+ applePhotosSync: () => ipcRenderer.invoke("memories:apple-photos-sync"),
 	getWatchedFolders: () => ipcRenderer.invoke("memories:get-watched-folders"),
 	getVersion: () => ipcRenderer.invoke("memories:get-version"),
 	revealWatchedFolder: (folder) =>

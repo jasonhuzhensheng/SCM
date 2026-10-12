@@ -1,0 +1,13 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),ts=require('typescript');
+const source=fs.readFileSync(path.join(__dirname,'../src/simple/assetFilters.ts'),'utf8');
+const context={exports:{}};vm.createContext(context);vm.runInContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,context);
+const {assetFilter,emptyAssetFilters,compareKnown,formatFileSize}=context.exports;
+let filter=assetFilter(emptyAssetFilters);assert(filter.matches(null,0));assert(!filter.active);
+filter=assetFilter({...emptyAssetFilters,minSize:'1',maxSize:'2'});assert(filter.matches(1e6,0));assert(filter.matches(2e6,0));assert(!filter.matches(999999,0));assert(!filter.matches(2000001,0));assert(!filter.matches(null,0));
+assert(assetFilter({...emptyAssetFilters,minSize:'2',maxSize:'1'}).error);assert(assetFilter({...emptyAssetFilters,minSize:'-1'}).error);assert(assetFilter({...emptyAssetFilters,maxSize:'Infinity'}).error);
+filter=assetFilter({...emptyAssetFilters,startDate:'2026-03-08',endDate:'2026-03-08'});
+assert(filter.matches(null,new Date(2026,2,8,0,0).getTime()));assert(filter.matches(null,new Date(2026,2,8,23,59,59,999).getTime()));assert(!filter.matches(null,new Date(2026,2,9,0,0).getTime()));assert(!filter.matches(null,0));
+assert(assetFilter({...emptyAssetFilters,startDate:'2026-02-30'}).error);assert(assetFilter({...emptyAssetFilters,startDate:'2026-10-12',endDate:'2026-10-11'}).error);
+filter=assetFilter({...emptyAssetFilters,minSize:'1',startDate:'2026-01-01'});assert(!filter.matches(5e5,new Date(2026,9,11).getTime()));assert(filter.matches(1e6,new Date(2026,9,11).getTime()));
+assert.deepEqual([null,3,0,1].sort((a,b)=>compareKnown(a,b,false)),[0,1,3,null]);assert.deepEqual([null,3,0,1].sort((a,b)=>compareKnown(a,b,true)),[3,1,0,null]);assert.equal(formatFileSize(1e6),'1.0 MB');
+console.log('PASS: size bounds, combined filters, invalid ranges, inclusive local dates, unknown values and sorting');

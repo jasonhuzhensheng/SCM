@@ -114,6 +114,7 @@ export function useMemorySearch(filenames: string[]) {
 		modelId: string;
 	} | null>(null);
 
+	const [partialSearch, setPartialSearch] = useState<{ indexed: number; total: number; modelId: string } | null>(null);
 	const filenamesRef = useRef<string[]>([]);
 	const embeddingsRef = useRef<Float32Array[] | null>(null);
 	const phraseEmbeddingsRef = useRef<Float32Array[] | null>(null);
@@ -621,7 +622,7 @@ export function useMemorySearch(filenames: string[]) {
 	const search = useCallback(
 		async (query: string, topK = 24): Promise<RankedMemory[]> => {
 			const trimmed = query.trim();
-			if (!trimmed || filenamesRef.current.length === 0) return [];
+			if (!trimmed) return [];
 
 			// File-level ranking on the main process (O(N × dim) cosine scan
 			// runs off the renderer's main thread). The IPC handler embeds the
@@ -650,6 +651,12 @@ export function useMemorySearch(filenames: string[]) {
 					dominant: r.dominant,
 					breakdown: r.breakdown,
 				}));
+				const coverage = rankedRaw as { partial?: boolean; indexed?: number; total?: number; modelId?: string } | null;
+				if (coverage?.partial) {
+					setPartialSearch({ indexed: coverage.indexed ?? 0, total: coverage.total ?? 0, modelId: coverage.modelId ?? "" });
+					return results; // Never rescue unindexed filenames or combine old scene vectors.
+				}
+				setPartialSearch(null);
 				if (qv && qv.length > 0) {
 					rankQueryVec = new Float32Array(qv);
 					const cacheKey0 = trimmed.toLowerCase().slice(0, 128);
@@ -659,8 +666,8 @@ export function useMemorySearch(filenames: string[]) {
 						if (first !== undefined) queryCacheRef.current.delete(first);
 					}
 				}
-			} catch {
-				results = [];
+			} catch (error) {
+				throw error instanceof Error ? error : new Error("画面搜索暂不可用，请稍后重试。");
 			}
 
 			if (results.length === 0) {
@@ -1040,6 +1047,7 @@ export function useMemorySearch(filenames: string[]) {
 		models,
 		activeModelId,
 		migration,
+		partialSearch,
 		modelPreloads,
 		preloadModel,
 		preloadAllModels,

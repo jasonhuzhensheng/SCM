@@ -245,15 +245,15 @@ function scoreLibrary(l, trimmed, qVec, topK, thresholds, norms) {
 			? l.ocrWords
 			: null;
 
-	// Adaptive cutoff: keep the top 60% of scored results. The old 5th-best
-	// reference was fragile with outlier distributions — one strong match
-	// defined the band and erased hundreds of honest tail results. The
-	// percentile approach preserves the full distribution shape: a tight
-	// cluster stays dense, a spread-out tail stays visible.
+	// A library percentile alone admits thousands of weak rows when topK is
+	// the library size. Also require relevance relative to the strongest
+	// visual evidence (before OCR boosts). Filename/phrase boosts must not
+	// raise this visual floor and erase genuine image matches.
 	if (scored.length > 0) {
 		const cutoffRank = Math.floor(scored.length * (1 - relativeKeep));
 		const cutoffScore = scored[Math.min(cutoffRank, scored.length - 1)].score;
-		const cutoff = Math.max(minScore, cutoffScore);
+		const bestVisual = scored.reduce((best, row) => Math.max(best, row._baseCosine), 0);
+		const cutoff = Math.max(minScore, cutoffScore, bestVisual * relativeKeep);
 		// Exact OCR word matches survive the percentile cutoff: literal
 		// visible text is high-precision evidence, not noise-tail filler,
 		// and the ordering-only boost below can only lift rows that are

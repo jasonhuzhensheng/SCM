@@ -1,3 +1,7 @@
+export interface ApplePhotosStatus {
+ supported: boolean; enabled: boolean; phase: string; indexed: number; total: number;
+ failed: number; error: string; limited: boolean; lastSync: string | null;
+}
 // Window bridge types — the preload script exposes window.memories.
 // L1 FP: fields are `readonly` (bridge payloads flow main -> renderer and
 // must never be mutated in place — copy-then-sort / spread instead).
@@ -419,7 +423,11 @@ export interface AiInsights {
 }
 
 interface MemoriesBridge {
+	fileSizes(names: string[]): Promise<{ filename: string; size: number | null }[]>;
 	photoLocations(names: string[]): Promise<{ locations: { filename: string; lat: number; lng: number }[]; errors: string[] }>;
+	detectionSearch(kind: "qr" | "barcode" | "text", query?: string): Promise<{ok:boolean; error?:string; filenames?:string[]; status?:{total:number; indexed:number; pending:number; failed:number; paused:boolean; reconciling:boolean}}>;
+ detectionPause(paused:boolean): Promise<{ok:boolean; error?:string}>;
+	qrScan(names: string[], kind?: "qr" | "barcode"): Promise<{ok: boolean; filenames?: string[]; errors?: number; error?: string}>;
 	pickTransferFolder(): Promise<{ ok: boolean; canceled?: boolean; error?: string; folderPath?: string; token?: string }>;
 	driveStatus(): Promise<{ ok: boolean; configured?: boolean; connected?: boolean; error?: string }>;
 	driveConfigure(): Promise<{ ok: boolean; configured?: boolean; connected?: boolean; canceled?: boolean; error?: string }>;
@@ -450,7 +458,7 @@ interface MemoriesBridge {
 					filename: number;
 					ocr: number;
 				};
-		  }[] & { queryVec?: number[] | null })
+		  }[] & { queryVec?: number[] | null; partial?: boolean; indexed?: number; total?: number; modelId?: string })
 		| {
 				results: {
 					filename: string;
@@ -464,6 +472,7 @@ interface MemoriesBridge {
 					};
 				}[];
 				queryVec: number[] | null;
+				partial?: boolean; indexed?: number; total?: number; modelId?: string;
 		  }
 	>;
 	/** Pure-visual scene moments (legacy-exact ranking, off-renderer).
@@ -502,6 +511,10 @@ interface MemoriesBridge {
 	getTranscribeState?(): Promise<StatusPayload | null>;
 	importPaths(paths: string[]): Promise<ImportResult>;
 	pickPhotos(): Promise<ImportResult | null>;
+ applePhotosStatus(): Promise<ApplePhotosStatus>;
+ applePhotosConnect(): Promise<ApplePhotosStatus>;
+ applePhotosPause(): Promise<ApplePhotosStatus>;
+ applePhotosSync(): Promise<ApplePhotosStatus>;
 	/** App version from package.json (Settings footer, N-06). */
 	getVersion(): Promise<string>;
 	/** Folders watched for auto-import (see WatchedFolder). */

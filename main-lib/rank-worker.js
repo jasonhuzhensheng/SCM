@@ -23,6 +23,8 @@ const {
 } = require("./library-store.js");
 const { initCategoryOverrides } = require("./category-overrides.js");
 const { scoreLibrary } = require("./rank-search.js");
+const { createLiveSearchCache } = require("./live-search-index.js");
+const liveCache = createLiveSearchCache();
 
 const userDataDir = process.env.SCM_USER_DATA_DIR;
 if (!userDataDir) {
@@ -54,15 +56,17 @@ if (process.parentPort) {
 			process.exit(0);
 			return;
 		}
-		if (msg.type === "rank") {
+		if (msg.type === "rank" || msg.type === "rank-live") {
 			const id = msg.id;
 			try {
 				const gen =
 					typeof msg.gen === "number" ? msg.gen : libraryGenerationNumber();
-				ensureLibrary(gen);
-				const l = loadLibrary();
+				let live = null;
+				if (msg.type === "rank-live") live = liveCache.apply(msg.live);
+				else { liveCache.clear(); ensureLibrary(gen); }
+				const l = live ? live.library : loadLibrary();
 				const thresholds = thresholdsFor(l.modelId) || {};
-				const norms = libraryNorms();
+				const norms = live ? live.norms : libraryNorms();
 				const qVec =
 					msg.qVec instanceof Float32Array
 						? msg.qVec

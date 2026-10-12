@@ -109,7 +109,7 @@ export default function EmbeddingVersionsPanel({
 		// instead of failing with a TypeError.
 		if (typeof window.memories.resetLibrary !== "function") {
 			setError(
-				"This window is from before the fresh-start update — restart SCM and try again.",
+				"This window is from before the fresh-start update — restart big2 photo and try again.",
 			);
 			return;
 		}

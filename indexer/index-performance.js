@@ -37,4 +37,23 @@ function createPhraseCache(limit = 512) {
   return value;
  };
 }
-module.exports = { readStats, createPhotoPrefetch, createPhraseCache };
+// UUIDs, long hashes and camera timestamps are identifiers, not captions.
+// Keep this conservative: meaningful/mixed names retain their exact phrase.
+// The lexical filename index still sees the original name, including IDs.
+function filenameNeedsEmbedding(filename) {
+ const stem = String(filename).replace(/\.[^.]+$/, '').replace(/(?: \(\d+\))+$/, '');
+ return !(/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(stem)
+  || /^(?:[a-f\d]{32}|[a-f\d]{40}|[a-f\d]{64})$/i.test(stem)
+  || /^(?:(?:IMG|DSC|DSCN|PXL)[_-]?)?\d{8,}$/i.test(stem));
+}
+// Full-vector checkpoints are expensive at library scale. Target 40 writes,
+// retaining a five-minute recovery bound when individual videos are slow.
+function createCheckpointGate(total, now = Date.now) {
+ const interval = Math.max(25, Math.ceil(total / 40));
+ let saved = 0, savedAt = now();
+ return done => {
+  if (done <= saved || (done - saved < interval && now() - savedAt < 300000)) return false;
+  saved = done; savedAt = now(); return true;
+ };
+}
+module.exports = { readStats, createPhotoPrefetch, createPhraseCache, filenameNeedsEmbedding, createCheckpointGate };

@@ -3,6 +3,7 @@ import { isVideoFile } from "@/lib/media";
 import type { RankedMemory } from "@/lib/memoryRank";
 
 export interface Asset extends RankedMemory {
+ detectedLabel?: string;
 	title: string;
 	sourcePath: string;
 	modifiedAt: number;

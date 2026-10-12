@@ -22,7 +22,7 @@ kbd { font-family: inherit; font-size: 11px; color: #8a938d; border: 1px solid #
 .brand { display: flex; gap: 11px; align-items: center; padding: 5px 12px 31px; }
 .brand-mark { display: grid; place-items: center; width: 36px; height: 40px; background: #29755c; border-radius: 11px; color: #fff; box-shadow: 0 3px 8px #214f4a12; }
 .brand strong { font-size: 22px; font-weight: 650; letter-spacing: 2px; display: flex; align-items: baseline; gap: 8px; }
-.brand-scm { color: #8b948b; font-size: 10px; letter-spacing: 1.1px; font-weight: 500; }
+.brand-english { color: #8b948b; font-size: 10px; letter-spacing: .2px; font-weight: 500; white-space: nowrap; }
 .brand small { display: block; font-size: 10px; color: #8b938c; margin-top: 3px; letter-spacing: .8px; }
 .nav-section-label { padding: 0 13px; font-size: 10px; color: #939c92; letter-spacing: 1.5px; margin-bottom: 11px; }
 .nav-item { display: flex; width: 100%; align-items: center; gap: 12px; background: transparent; color: #687368; min-height: 43px; border-radius: 7px; padding: 10px 12px; margin-bottom: 4px; font-size: 14px; text-align: left; }
@@ -208,7 +208,7 @@ kbd { font-family: inherit; font-size: 11px; color: #8a938d; border: 1px solid #
 .drive-modal a, .settings-section details a { text-decoration: underline; color: #426d43; }
 .settings-section details summary { cursor: pointer; font-size: 12px; margin: 12px 0; }
 
-.map-toggle { display:flex; align-items:center; gap:16px; margin:20px 0; font-size:13px; color:#657063; }
+.map-toggle { display:flex; align-items:center; flex-wrap:wrap; gap:10px; font-size:13px; color:#657063; }
 .map-search { padding:20px; background:#fff; border:1px solid #dce2d8; border-radius:18px; margin-bottom:22px; }
 .map-heading { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:16px; }
 .map-heading h3 { margin:0 0 6px; font-size:18px; }
@@ -247,3 +247,74 @@ kbd { font-family: inherit; font-size: 11px; color: #8a938d; border: 1px solid #
 .viewer-delete:hover:not(:disabled) { color:#ffd8d2; background:#a535352e; }
 .viewer-delete:disabled { opacity:.5; cursor:not-allowed; }
 @media(max-width:860px) { .viewer-actions { flex-wrap:wrap; gap:6px; } }
+
+.asset-context-menu .context-preview { color:#365746; }
+.asset-context-menu .context-preview:hover,.asset-context-menu .context-preview:focus-visible { background:#edf4ec; outline-color:#7b9980; }
+
+.filter-toggle { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+.asset-filters { display:flex; flex-wrap:wrap; gap:18px; background:#f4f6ef; padding:18px; border:1px solid #dce2d8; border-radius:12px; }
+.asset-filters fieldset { display:flex; flex-wrap:wrap; align-items:end; gap:10px; border:0; padding:0; margin:0; min-width:0; }
+.asset-filters legend { font-size:12px; color:#53664f; padding:0 0 12px; }
+.asset-filters label { display:grid; gap:6px; font-size:12px; }
+.asset-filters input { width:150px; max-width:100%; border:1px solid #cbd7c8; border-radius:6px; padding:8px; background:#fff; color:#34512e; }
+.asset-filters p { width:100%; font-size:12px; color:#657063; margin:0; }
+.filter-status { font-size:12px; color:#657063; }
+.file-size-label { position:absolute; right:8px; bottom:8px; z-index:2; border-radius:4px; background:#203126b8; color:#fff; padding:3px 6px; font-size:11px; pointer-events:none; }
+
+.search-filter-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:10px 12px; margin:16px 0 12px; }
+.search-filter-toolbar .secondary-button { min-height:38px; white-space:nowrap; }
+.search-filter-toolbar .text-button { white-space:nowrap; }
+.search-filter-toolbar ~ .results-toolbar { margin-top:16px; }
+
+/* A persistent, non-modal transfer surface, portaled outside the batch toolbar. */
+.transfer-status-tab { position: fixed; right: 20px; bottom: 20px; z-index: 130; display: flex; align-items: center; gap: 12px; width: 260px; padding: 15px 18px 19px; border: 1px solid #dce6d8; border-radius: 12px; background: #fffefb; color: #25483d; box-shadow: 0 6px 24px #20302420; text-align: left; overflow: hidden; }
+.transfer-status-tab span { flex: 1; min-width: 0; }
+.transfer-status-tab strong, .transfer-status-tab small { display: block; }
+.transfer-status-tab strong { font-size: 13px; }
+.transfer-status-tab small { font-size: 11px; margin-top: 5px; color: #66776b; }
+.transfer-status-tab progress { position: absolute; bottom: 0; left: 0; width: 100%; height: 4px; border: 0; accent-color: #21664e; }
+.transfer-panel-anchor { position: fixed; right: 20px; bottom: 108px; z-index: 130; width: min(410px, calc(100vw - 40px)); }
+.transfer-side-panel { width: 100%; max-height: calc(100dvh - 140px); box-shadow: 0 10px 40px #20302425; border: 1px solid #dce6d8; }
+.transfer-side-panel > header { padding: 20px; }
+.transfer-side-panel > header h2 { font-size: 18px; }
+.transfer-side-panel .settings-body { padding: 0 20px; }
+.transfer-side-panel .settings-section { padding: 18px 0; }
+.transfer-side-panel .drive-filename { overflow-wrap: anywhere; }
+.transfer-status-tab:focus-visible { outline: 2px solid #21664e; outline-offset: 3px; }
+@media (max-width: 650px) { .transfer-status-tab { right: 12px; bottom: 12px; width: 235px; } .transfer-panel-anchor { right: 12px; bottom: 100px; width: calc(100vw - 24px); } }
+
+.qr-match .asset-image img { object-fit: contain; }
+.qr-match .asset-open:hover .asset-image img { transform: none; }
+
+/* Progress: numbers lead; explanatory text stays secondary. */
+.progress-toast { max-width: calc(100vw - 32px); padding: 12px 22px; }
+.progress-toast .progress-content { width: 220px; max-width: calc(100vw - 110px); }
+.progress-toast .progress-description { font-size: 11px; font-weight: 500; color: #71836e; }
+.progress-toast .progress-percent { font-size: 24px; font-weight: 650; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.progress-percent small { font-size: 13px; margin-left: 2px; }
+.progress-count { display: flex; align-items: baseline; gap: 5px; margin: 2px 0 4px; font-variant-numeric: tabular-nums; }
+.progress-toast .progress-count strong { font-size: 22px; font-weight: 650; color: #345c40; }
+.progress-total { font-size: 18px; color: #70866b; }
+.progress-divider { font-size: 18px; color: #a1af9c; }
+.progress-count small { font-size: 10px; color: #8a9984; }
+.progress-eta { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-top: 4px; }
+.progress-eta > span { font-size: 10px; color: #8a9984; }
+.progress-toast .progress-eta strong { font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.progress-toast .index-progress { margin-top: 4px; height: 4px; }
+@media(max-width:650px) { .progress-toast { right: 16px; bottom: 16px; padding: 12px 16px; gap: 10px; } .progress-toast .progress-count strong { font-size:22px; } .progress-total { font-size:18px; } }
+
+/* Shared flow keeps import, transfer and expanded details from overlapping. */
+.task-status-stack { position: fixed; right: 24px; bottom: 24px; z-index: 130; display: flex; flex-direction: column; align-items: flex-end; gap: 12px; max-width: calc(100vw - 48px); max-height: calc(100dvh - 48px); overflow-y: auto; padding: 4px; pointer-events: none; }
+.task-status-stack > * { flex-shrink: 0; pointer-events: auto; }
+.task-status-stack .progress-toast, .task-status-stack .transfer-status-tab, .task-status-stack .transfer-panel-anchor { position: relative; right: auto; bottom: auto; max-width: 100%; }
+.task-status-stack .transfer-panel-anchor { order: -1; flex-shrink: 1; min-height: 0; overflow-y: auto; }
+.task-status-stack .transfer-side-panel { max-height: none; }
+@media (max-width: 650px) { .task-status-stack { right: 12px; bottom: 12px; max-width: calc(100vw - 24px); max-height: calc(100dvh - 24px); } }
+
+/* Keep file metadata outside the thumbnail so it cannot cover duration. */
+.asset-caption .asset-location { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 5px; }
+.asset-caption .asset-metadata { flex-wrap: wrap; justify-content: flex-start; gap: 4px 12px; }
+.asset-caption .asset-metadata span { white-space: normal; overflow: visible; }
+.asset-caption .asset-context { margin-top: 5px; }
+.asset-image .video-label { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.asset-image .match-label { bottom: 38px; max-width: calc(100% - 18px); }

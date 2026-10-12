@@ -59,7 +59,7 @@ function Switch({
 }
 
 // The "Menu Bar" section inside the Settings sheet. An opt-in toggle for
-// menu-bar-only mode: the Dock icon hides, an SCM icon lives in the menu
+// menu-bar-only mode: the Dock icon hides, an big2 photo icon lives in the menu
 // bar (left-click toggles the window, right-click opens Open / Import /
 // Settings / Quit plus live library + AI status), closing the window hides
 // it there instead of quitting, and Quit happens from the menu-bar icon.
@@ -109,7 +109,7 @@ export default function MenuBarPanel({
 					setEnabled(res.enabled ?? next);
 					onNotify(
 						next
-							? "Menu bar only — SCM hid from the Dock. Click the menu-bar icon to toggle the window; quit from its menu."
+							? "Menu bar only — big2 photo hid from the Dock. Click the menu-bar icon to toggle the window; quit from its menu."
 							: "Dock icon restored",
 						"success",
 					);
@@ -171,7 +171,7 @@ export default function MenuBarPanel({
 							Menu Bar
 						</p>
 						<p className="truncate text-[13px] text-zinc-500 dark:text-zinc-400">
-							Run SCM from the menu bar, hide the Dock icon
+							Run big2 photo from the menu bar, hide the Dock icon
 						</p>
 					</div>
 				</div>
@@ -184,7 +184,7 @@ export default function MenuBarPanel({
 						<span className="block text-sm font-semibold text-zinc-800 dark:text-zinc-100">
 							Menu bar only
 						</span>
-						Hide SCM from the Dock and keep it in the menu bar. Closing the
+						Hide big2 photo from the Dock and keep it in the menu bar. Closing the
 						window hides it there instead of quitting.
 					</p>
 					<Switch
@@ -204,7 +204,7 @@ export default function MenuBarPanel({
 								Open at login
 							</span>
 							<span className="block text-[13px] text-zinc-500 dark:text-zinc-400">
-								Start SCM when you sign in
+								Start big2 photo when you sign in
 							</span>
 						</p>
 						<Switch
@@ -215,8 +215,8 @@ export default function MenuBarPanel({
 								saveTrayPatch(
 									{ openAtLogin: !tray.openAtLogin },
 									tray.openAtLogin
-										? "SCM won't open at login"
-										: "SCM will open at login",
+										? "big2 photo won't open at login"
+										: "big2 photo will open at login",
 								)
 							}
 						/>
@@ -241,8 +241,8 @@ export default function MenuBarPanel({
 								saveTrayPatch(
 									{ startHidden: !tray.startHidden },
 									tray.startHidden
-										? "SCM will show its window at launch"
-										: "SCM will start hidden in the menu bar",
+										? "big2 photo will show its window at launch"
+										: "big2 photo will start hidden in the menu bar",
 								)
 							}
 						/>

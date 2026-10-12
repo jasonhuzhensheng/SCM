@@ -23,14 +23,25 @@ const end=code.indexOf('// App icon (Dock + BrowserWindow).',start);
   order.length=0;fail=true;result=await handler(event,{filenames:['a.jpg'],mode:'move'});assert.equal(result.results[0].ok,false);assert(fs.existsSync(path.join(dir,'a.jpg')));assert.equal(l.filenames.length,2);assert.deepEqual(order,['verified']);
   order.length=0;fail=false;result=await handler(event,{filenames:['a.jpg'],mode:'move'});assert(result.results[0].ok);assert.deepEqual(order,['verified','suppressed','drop','remove','save']);assert.deepEqual(l.filenames,['b.jpg']);
   result=await handler(event,{filenames:['../outside'],mode:'move'});assert.equal(result.ok,false);
-  ctx.importInFlight=true;result=await handler(event,{filenames:['b.jpg'],mode:'move'});assert.equal(result.ok,false);assert(fs.existsSync(path.join(dir,'b.jpg')));
+  ctx.importInFlight=true;result=await handler(event,{filenames:['b.jpg'],mode:'copy'});assert.equal(result.ok,true);assert(fs.existsSync(path.join(dir,'b.jpg')));
+  ctx.migrationState={targetId:'model'};result=await handler(event,{filenames:['b.jpg'],mode:'move'});assert.equal(result.ok,false);assert.match(result.error,/索引切换/);assert(fs.existsSync(path.join(dir,'b.jpg')));
+  ctx.migrationState=null;ctx.driveTransfer=new AbortController();result=await handler(event,{filenames:['b.jpg'],mode:'move'});assert.equal(result.ok,false);assert.match(result.error,/传输或删除/);assert(fs.existsSync(path.join(dir,'b.jpg')));ctx.driveTransfer=null;
   ctx.importInFlight=false;
   ctx.selectedTransferFolder={directory:dir,token:'chosen'};
   ctx.require=()=>require('../main-lib/folder-transfer');
   ctx.drive.status=()=>({connected:false});
   result=await handler(event,{filenames:['b.jpg'],mode:'move',destination:'folder',folderToken:'wrong'});assert.equal(result.ok,false);assert(fs.existsSync(path.join(dir,'b.jpg')));
   result=await handler(event,{filenames:['b.jpg'],mode:'copy',destination:'folder',folderToken:'chosen'});assert.equal(result.results[0].ok,true);assert.equal(fs.readFileSync(path.join(result.folderPath,'b.jpg'),'utf8'),'fixture');assert(fs.existsSync(path.join(dir,'b.jpg')));
-  result=await handler(event,{filenames:['b.jpg'],mode:'move',destination:'folder',folderToken:'chosen'});assert.equal(result.results[0].ok,true);assert.equal(fs.readFileSync(path.join(result.folderPath,'b.jpg'),'utf8'),'fixture');assert(!fs.existsSync(path.join(dir,'b.jpg')));assert.equal(l.filenames.length,0);
+  ctx.importInFlight=true;
+  // A new import commits while the selected file is being copied. Its row
+  // must survive removal of the earlier selected row.
+  const realTransfer=require('../main-lib/folder-transfer');
+  ctx.require=()=>({copyVerified:async(...args)=>{
+   l.filenames.push('new.jpg');l.sources.push('original-new');fs.writeFileSync(path.join(dir,'new.jpg'),'new import');
+   const blocked=await handler(event,{filenames:['b.jpg'],mode:'copy',destination:'folder',folderToken:'chosen'});assert.equal(blocked.ok,false);
+   return realTransfer.copyVerified(...args);
+  }});
+  result=await handler(event,{filenames:['b.jpg'],mode:'move',destination:'folder',folderToken:'chosen'});assert.equal(result.results[0].ok,true);assert.equal(fs.readFileSync(path.join(result.folderPath,'b.jpg'),'utf8'),'fixture');assert(!fs.existsSync(path.join(dir,'b.jpg')));assert.deepEqual(l.filenames,['new.jpg']);assert.deepEqual(l.sources,['original-new']);assert(fs.existsSync(path.join(dir,'new.jpg')));assert.equal(ctx.driveTransfer,null);
   console.log('PASS: local folder copy/move without OAuth, invalid picker token; copy preserves local file, move deletes only after verified upload, failure retains file/index, deduplication, path validation and busy guard');
  }finally{fs.rmSync(dir,{recursive:true,force:true});}
 })().catch(e=>{console.error(e);process.exitCode=1;});

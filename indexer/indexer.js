@@ -392,13 +392,14 @@ async function loadModels() {
 	}
 }
 
-const { createPhotoPrefetch, createPhraseCache } = require("./index-performance.js");
+const { createPhotoPrefetch, createPhraseCache, filenameNeedsEmbedding } = require("./index-performance.js");
 const photoPrefetch = createPhotoPrefetch(async file => {
  const s = await ensureModel();
  return core.decodeToRaw(file, s.sharp, MODEL_CONFIG.inputSize);
 });
 const cachedPhrase = createPhraseCache();
 async function filenameVector(s, filename) {
+ if (!filenameNeedsEmbedding(filename)) return new Float32Array(s.dim);
  if (!s.tokenizer || !s.textModel) return null;
  const phrase = buildFilenamePhrase(filename);
  return cachedPhrase(s, phrase, async () => core.centerOrRaw(
@@ -799,6 +800,7 @@ async function embedTexts(texts) {
 // all-zero by a text-model outage, or a misaligned bin).
 async function embedPhrase(filename) {
 	const s = await ensureModel();
+	if (!filenameNeedsEmbedding(filename)) return Array.from(new Float32Array(s.dim));
 	if (!s.tokenizer || !s.textModel) return null;
 	const vec = await core.embedText(
 		buildFilenamePhrase(filename),
@@ -924,12 +926,13 @@ if (process.parentPort) {
 	// embeds (high) always run ahead of background scene enrichment (low).
 	// A query that arrives mid-enrichment waits only for the current
 	// ≤16-segment chunk, then jumps the remaining chunks.
+	const queryPending = [];
 	const highPending = [];
 	const lowPending = [];
 	let queueBusy = false;
 	const pump = () => {
 		if (queueBusy) { photoPrefetch.prime(highPending[0]); return; }
-		const message = highPending.shift() || lowPending.shift();
+		const message = queryPending.shift() || highPending.shift() || lowPending.shift();
 		if (!message) return;
 		queueBusy = true;
 		Promise.resolve()
@@ -959,7 +962,7 @@ if (process.parentPort) {
 			void handleMessage(message);
 			return;
 		}
-		(message.type === "enrich-video" ? lowPending : highPending).push(message);
+		(message.type === "embed-query" ? queryPending : message.type === "enrich-video" ? lowPending : highPending).push(message);
 		pump();
 	});
 }
