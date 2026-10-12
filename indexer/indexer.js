@@ -392,13 +392,23 @@ async function loadModels() {
 	}
 }
 
-async function embedPhoto(filePath, filename) {
+const { createPhotoPrefetch, createPhraseCache } = require("./index-performance.js");
+const photoPrefetch = createPhotoPrefetch(async file => {
+ const s = await ensureModel();
+ return core.decodeToRaw(file, s.sharp, MODEL_CONFIG.inputSize);
+});
+const cachedPhrase = createPhraseCache();
+async function filenameVector(s, filename) {
+ if (!s.tokenizer || !s.textModel) return null;
+ const phrase = buildFilenamePhrase(filename);
+ return cachedPhrase(s, phrase, async () => core.centerOrRaw(
+  await core.embedText(phrase, textPair(s), s.dim, MODEL_CONFIG.textMaxLength), s.textMean,
+ ));
+}
+async function embedPhoto(filePath, filename, message) {
 	const s = await ensureModel();
-	const first = await core.decodeToRaw(
-		filePath,
-		s.sharp,
-		MODEL_CONFIG.inputSize,
-	);
+	const first = message ? await photoPrefetch.take(message)
+  : await core.decodeToRaw(filePath, s.sharp, MODEL_CONFIG.inputSize);
 	let vec = await core.embedRawImage(
 		s.extractor,
 		s.RawImage,
@@ -431,18 +441,7 @@ async function embedPhoto(filePath, filename) {
 		}
 	}
 
-	let phrase = null;
-	if (s.tokenizer && s.textModel) {
-		phrase = core.centerOrRaw(
-			await core.embedText(
-				buildFilenamePhrase(filename),
-				textPair(s),
-				s.dim,
-				MODEL_CONFIG.textMaxLength,
-			),
-			s.textMean,
-		);
-	}
+	const phrase = await filenameVector(s, filename);
 
 	return {
 		vec: Array.from(vec),
@@ -474,18 +473,7 @@ async function embedVideo(filePath, filename) {
 		vec = vec ? averageVectors(vec, frameVec) : frameVec;
 	}
 
-	let phrase = null;
-	if (s.tokenizer && s.textModel) {
-		phrase = core.centerOrRaw(
-			await core.embedText(
-				buildFilenamePhrase(filename),
-				textPair(s),
-				s.dim,
-				MODEL_CONFIG.textMaxLength,
-			),
-			s.textMean,
-		);
-	}
+	const phrase = await filenameVector(s, filename);
 
 	return {
 		vec: vec ? Array.from(vec) : null,
@@ -853,7 +841,7 @@ async function handleMessage(message) {
 		}
 		if (type === "embed-photo") {
 			const { path: filePath, filename } = message;
-			const { vec, phrase } = await embedPhoto(filePath, filename);
+			const { vec, phrase } = await embedPhoto(filePath, filename, message);
 			post({ type: "photo-done", id, ok: true, vec, phrase });
 			return;
 		}
@@ -940,12 +928,17 @@ if (process.parentPort) {
 	const lowPending = [];
 	let queueBusy = false;
 	const pump = () => {
-		if (queueBusy) return;
+		if (queueBusy) { photoPrefetch.prime(highPending[0]); return; }
 		const message = highPending.shift() || lowPending.shift();
 		if (!message) return;
 		queueBusy = true;
 		Promise.resolve()
-			.then(() => handleMessage(message))
+			.then(() => {
+    const running = handleMessage(message);
+    // embedPhoto first awaits model readiness; next event-loop turn sees its consumed slot.
+    setImmediate(() => photoPrefetch.prime(highPending[0]));
+    return running;
+   })
 			.catch((err) =>
 				console.error(`[indexer] message handler error: ${err.message}`),
 			)

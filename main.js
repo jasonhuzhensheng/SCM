@@ -287,6 +287,113 @@ initLlmServer({
 	},
 });
 
+const { createSearchTranslator } = require("./main-lib/search-translation.js");
+const translateSearchQuery = createSearchTranslator({
+	chat: llmChat,
+	getModelId: () => readLlmConfig().chatModel,
+	isAvailable: modelId => llmBinaryDownloaded() && llmModelDownloaded(modelId),
+});
+ipcMain.handle("memories:translate-search", async (_event, text) => {
+	try { return { ok: true, text: await translateSearchQuery(text) }; }
+	catch (error) { return { ok: false, error: error.message || "中文翻译失败，请重试。" }; }
+});
+
+// Google Drive transfers always use app-managed originals, never renderer paths.
+const drive = require("./main-lib/google-drive.js").createGoogleDrive({
+	userDataDir: app.getPath("userData"), safeStorage: require("electron").safeStorage,
+	openExternal: url => shell.openExternal(url),
+});
+let driveTransfer = null;
+const movedSourcesFile = path.join(app.getPath("userData"), "drive-moved-sources.json");
+let movedSources = {};
+try { movedSources = JSON.parse(fs.readFileSync(movedSourcesFile, "utf8")); } catch { /* first run */ }
+async function persistMovedSource(source) {
+	if (!source) return;
+	try {
+		const stat = await fs.promises.stat(source);
+		movedSources[source] = { size: stat.size, mtimeMs: stat.mtimeMs };
+	} catch { return; }
+	await fs.promises.writeFile(movedSourcesFile + ".tmp", JSON.stringify(movedSources), { mode: 0o600 });
+	await fs.promises.rename(movedSourcesFile + ".tmp", movedSourcesFile);
+}
+async function wasMovedToDrive(source) {
+	const record = movedSources[source]; if (!record) return false;
+	try { const stat = await fs.promises.stat(source); return stat.size === record.size && stat.mtimeMs === record.mtimeMs; } catch { return false; }
+}
+const driveReply = async task => { try { return { ok: true, ...await task() }; } catch (error) { return { ok: false, error: error.message || "Google Drive 操作失败。" }; } };
+let selectedTransferFolder = null;
+ipcMain.handle("memories:pick-transfer-folder", () => driveReply(async () => {
+ if (driveTransfer) throw new Error("请等待当前传输完成。");
+ const picked = await dialog.showOpenDialog({ title: "选择 Google Drive 或其他目标文件夹", properties: ["openDirectory", "createDirectory"] });
+ if (picked.canceled) return { canceled: true };
+ const directory = await fs.promises.realpath(picked.filePaths[0]);
+ const managed = await fs.promises.realpath(PHOTOS_DIR);
+ if (directory === managed || directory.startsWith(managed + path.sep)) throw new Error("请选择素材库以外的文件夹。");
+ selectedTransferFolder = { directory, token: crypto.randomUUID() };
+ return { folderPath: directory, token: selectedTransferFolder.token };
+}));
+ipcMain.handle("memories:drive-status", () => driveReply(async () => drive.status()));
+ipcMain.handle("memories:drive-configure", () => driveReply(async () => {
+	if (driveTransfer) throw new Error("上传期间不能更改账号配置。");
+	const result = await dialog.showOpenDialog({ title: "导入 Google OAuth 桌面应用配置", properties: ["openFile"], filters: [{ name: "OAuth JSON", extensions: ["json"] }] });
+	if (result.canceled) return { canceled: true };
+	const stat = await fs.promises.stat(result.filePaths[0]); if (stat.size > 65536) throw new Error("配置文件过大。");
+	return drive.configure(JSON.parse(await fs.promises.readFile(result.filePaths[0], "utf8")));
+}));
+ipcMain.handle("memories:drive-login", () => driveReply(async () => { if (driveTransfer) throw new Error("请等待上传完成。"); return drive.login(); }));
+ipcMain.handle("memories:drive-disconnect", () => driveReply(async () => { if (driveTransfer) throw new Error("请等待上传完成。"); return drive.disconnect(); }));
+ipcMain.handle("memories:drive-cancel", () => { driveTransfer?.abort(); return { ok: true }; });
+ipcMain.handle("memories:drive-transfer", (event, options) => driveReply(async () => {
+	if (driveTransfer || importInFlight || migrationState) throw new Error("请等待当前导入、索引切换或上传结束。");
+	const localFolder = options?.destination === "folder";
+ const destination = localFolder && selectedTransferFolder?.token === options.folderToken ? selectedTransferFolder.directory : null;
+ if (localFolder && !destination) throw new Error("请重新选择目标文件夹。");
+ if (!localFolder && !drive.status().connected) throw new Error("请先在设置中连接 Google Drive。");
+	if (!Array.isArray(options?.filenames) || !["copy", "move"].includes(options?.mode)) throw new Error("无效的传输请求。");
+	const names = [...new Set(options.filenames)];
+	const l = loadLibrary();
+	if (!names.length || names.length > 10000 || names.some(name => typeof name !== "string" || path.basename(name) !== name || !l.filenames.includes(name))) throw new Error("选择包含无效素材，请重新选择。");
+	const folderName = String(options.folderName || "SCM 搜索结果").trim().slice(0, 160);
+	const controller = new AbortController(); driveTransfer = controller;
+	const results = []; let folder;
+	const emit = payload => { if (!event.sender.isDestroyed()) event.sender.send("memories:drive-progress", payload); };
+	try {
+		folder = localFolder
+   ? { localPath: await fs.promises.mkdtemp(path.join(destination, "SCM 搜索结果-")) }
+   : await drive.createFolder(folderName, controller.signal);
+		for (const filename of names) {
+			if (controller.signal.aborted) break;
+			try {
+				const i = l.filenames.indexOf(filename); if (i < 0) throw new Error("素材已移除。");
+				const source = l.sources[i];
+				const file = path.join(PHOTOS_DIR, filename);
+				emit({ done: results.length, total: names.length, filename, percent: 0 });
+				const onProgress = (sent, size) => emit({ done: results.length, total: names.length, filename, percent: size ? Math.floor(sent / size * 100) : 100 });
+    const remote = localFolder
+     ? { localPath: await require("./main-lib/folder-transfer.js").copyVerified(file, filename, folder.localPath, controller.signal, onProgress) }
+     : await drive.upload(file, filename, folder.id, controller.signal, onProgress);
+				controller.signal.throwIfAborted();
+				if (options.mode === "move") {
+					await persistMovedSource(source);
+					dropQueuedJobsFor(filename);
+					// Fail visibly if the local copy cannot be deleted; never report a successful move.
+					await fs.promises.unlink(file);
+					if (!removeLibraryRow(filename)) throw new Error("文件已复制，但移除搜索记录失败。");
+					await saveLibrary();
+				}
+				results.push({ filename, ok: true, url: remote.webViewLink || "" });
+			} catch (error) {
+				results.push({ filename, ok: false, error: controller.signal.aborted ? "已取消，素材库副本保留（目标位置可能已有副本）。" : error.message });
+			}
+			emit({ done: results.length, total: names.length, filename, percent: 100 });
+		}
+		return { results, canceled: controller.signal.aborted, folderUrl: folder.webViewLink || "", folderPath: folder.localPath || "" };
+	} finally {
+		driveTransfer = null;
+		for (const win of BrowserWindow.getAllWindows()) win.webContents.send("memories:status", { type: "library-updated" });
+	}
+}));
+
 // App icon (Dock + BrowserWindow). Users pick one of the 1024×1024 PNGs in
 // public/images/app-icons/ via Settings → Appearance. Persisted as
 // settings.json `appIcon` (validated; defaults to scm-vhs). Loaded through fs
@@ -373,6 +480,17 @@ try {
 	currentAppIconId = DEFAULT_APP_ICON;
 }
 const PHOTOS_DIR = path.join(DATA_DIR, "photos");
+const readPhotoLocations = require("./main-lib/photo-location.js").createLocationIndex({
+ directory: PHOTOS_DIR, cachePath: path.join(DATA_DIR, "photo-locations.json"),
+ metadata: file => require("sharp")(file).metadata(),
+});
+const loadMapTile = require("./main-lib/map-tiles.js").createTileLoader(path.join(DATA_DIR, "map-tiles"));
+ipcMain.handle("memories:photo-locations", async (_event, names) => {
+ if (!Array.isArray(names) || names.length > 50 || names.some(n => typeof n !== "string")) throw new Error("Invalid location batch");
+ const known = new Set(loadLibrary().filenames);
+ return readPhotoLocations([...new Set(names)].filter(n => known.has(n)));
+});
+
 const POSTERS_DIR = path.join(DATA_DIR, "posters");
 const THUMBS_DIR = path.join(DATA_DIR, "thumbs");
 // In-app preview proxies for searchable-only videos (mkv/hevc/...): short
@@ -1548,6 +1666,7 @@ function rowSourcePath(i) {
 // Bounded-concurrency pump, sized like the import pipeline (pool×2).
 const MIGRATE_CONCURRENCY = Math.max(2, INDEXER_POOL_SIZE * 2);
 async function reembedToModel(targetId) {
+	if (driveTransfer) throw new Error("请等待 Google Drive 上传完成。");
 	const target = getModel(targetId);
 	if (!target) throw new Error(`Unknown model: ${targetId}`);
 	// An in-flight import embeds rows through the pool, which a migration
@@ -2215,10 +2334,10 @@ function modelsManifest() {
 
 // Recursively collect every supported media file under `dir`. Symlinked
 // directories are skipped to avoid cycles; unreadable entries are ignored.
-function scanDirForMedia(dir, out = []) {
+async function scanDirForMedia(dir, out = []) {
 	let entries;
 	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
+		entries = await fs.promises.readdir(dir, { withFileTypes: true });
 	} catch {
 		return out;
 	}
@@ -2227,14 +2346,14 @@ function scanDirForMedia(dir, out = []) {
 		if (entry.isDirectory()) {
 			// Never recurse into symlinked directories (cycle risk); real
 			// subdirectories are scanned recursively.
-			if (!entry.isSymbolicLink()) scanDirForMedia(full, out);
+			if (!entry.isSymbolicLink()) await scanDirForMedia(full, out);
 		} else if (entry.isSymbolicLink()) {
 			// Follow symlinks that resolve to media files (common in iCloud /
-			// cloud-sync folders); statSync resolves the target, unlike the
+			// cloud-sync folders); stat resolves the target, unlike the
 			// lstat-based Dirent flags.
 			try {
 				if (
-					fs.statSync(full).isFile() &&
+					(await fs.promises.stat(full)).isFile() &&
 					IMPORT_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
 				) {
 					out.push(full);
@@ -2255,17 +2374,17 @@ function scanDirForMedia(dir, out = []) {
 // Collapse a list of picked/dropped paths into importable files: directories
 // expand to their media contents (recursive); plain files pass through so the
 // per-file importer can still report unsupported ones.
-function expandMediaPaths(paths) {
+async function expandMediaPaths(paths) {
 	const out = [];
 	for (const p of paths) {
 		let stat;
 		try {
-			stat = fs.statSync(p);
+			stat = await fs.promises.stat(p);
 		} catch {
 			out.push(p); // let importPaths report "File not found"
 			continue;
 		}
-		if (stat.isDirectory()) scanDirForMedia(p, out);
+		if (stat.isDirectory()) await scanDirForMedia(p, out);
 		else out.push(p);
 	}
 	return out;
@@ -2356,7 +2475,7 @@ function copyFileWithWatchdog(
 			}
 		}, tickMs);
 		fs.promises
-			.copyFile(src, dst)
+			.copyFile(src, dst, fs.constants.COPYFILE_FICLONE)
 			.then((r) => {
 				if (settled) return;
 				clearInterval(timer);
@@ -2423,6 +2542,7 @@ let importInFlight = false;
 // The import-failure cache is only consulted for these: a manual re-import is
 // the user explicitly asking for a fresh attempt, so it always runs.
 async function importPaths(rawPaths, { fromWatch = false } = {}) {
+	if (driveTransfer) return { added: [], skipped: [], errors: [{ file: "", error: "请等待 Google Drive 上传完成。" }], watched: [] };
 	// A model migration re-embeds the whole library and pins the worker
 	// pool to the target model. Rows imported mid-migration would be
 	// embedded in the WRONG model — they'd land as target-model vectors in
@@ -2464,6 +2584,11 @@ async function importPaths(rawPaths, { fromWatch = false } = {}) {
 	let result;
 	try {
 		result = await importPathsInner(rawPaths, { fromWatch });
+	} catch (error) {
+		for (const win of BrowserWindow.getAllWindows()) {
+			win.webContents.send("memories:status", { type: "import", phase: "done", filename: "" });
+		}
+		throw error;
 	} finally {
 		importInFlight = false;
 		updateTrayState();
@@ -2487,7 +2612,10 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	spawnIndexer();
 	// Any path may be a directory (folder picker / folder drop): expand it to
 	// the media files inside so the batch counter below counts real files.
-	const paths = expandMediaPaths(rawPaths);
+	for (const win of BrowserWindow.getAllWindows()) {
+		win.webContents.send("memories:status", { type: "import", phase: "scanning", filename: "", done: 0, total: 0 });
+	}
+	const paths = await expandMediaPaths(rawPaths);
 
 	// Auto-watch folders: any DIRECTORY in the batch joins the persisted
 	// watch list (the expand above already flattened it to files — rawPaths
@@ -2497,7 +2625,7 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	const watchedNow = [];
 	for (const raw of rawPaths) {
 		try {
-			if (fs.statSync(raw).isDirectory() && addWatchedFolder(raw)) {
+			if ((await fs.promises.stat(raw)).isDirectory() && addWatchedFolder(raw)) {
 				watchedNow.push(path.basename(raw));
 			}
 		} catch {
@@ -2546,7 +2674,12 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	// A watched-folder scan has no chronological ordering guarantee. The
 	// ordered flush below persists this sequence, and the All/File UI reads
 	// the tail first, so establish source mtime order before dispatching work.
-	uniquePaths = sortPathsByMtime(uniquePaths, fs.statSync);
+	// Read metadata asynchronously: cloud-backed folders can take seconds per
+	// stat and must never block the UI or the native file picker.
+	const sourceStats = await require("./indexer/index-performance.js").readStats(
+		uniquePaths, file => fs.promises.stat(file),
+	);
+	uniquePaths = sortPathsByMtime(uniquePaths, filePath => sourceStats.get(filePath));
 
 	// Video posters are generated off the import critical path (see below);
 	// all jobs must settle before the library-updated broadcast so the
@@ -2705,18 +2838,10 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			// poison — don't re-copy + re-attempt it on every poll/event. Only
 			// watched-folder syncs consult the cache: a manual re-import is the
 			// user explicitly asking for a fresh attempt.
-			if (fromWatch && isKnownImportFailure(filePath)) {
+			if (fromWatch && (await wasMovedToDrive(filePath) || isKnownImportFailure(filePath))) {
 				return { kind: "skipped", filePath };
 			}
-			if (!fs.existsSync(filePath)) {
-				return {
-					kind: "error",
-					filename: filePath,
-					dest,
-					err: new Error("File not found"),
-				};
-			}
-			const sourceStat = fs.statSync(filePath);
+			const sourceStat = await fs.promises.stat(filePath);
 			if (!sourceStat.isFile()) {
 				return {
 					kind: "error",
@@ -3004,19 +3129,19 @@ const WATCH_POLL_INTERVAL_MS = 60_000;
 // migration owns the pipeline, importPaths would refuse, so retry shortly
 // instead of dropping the change. Resolves when the (possibly empty) sync
 // import settles.
-function syncWatchedFolder(folder) {
+async function syncWatchedFolder(folder) {
 	// A scheduled retry can outlive the watch itself (the user removed the
 	// folder while an import was busy). Never sync — or worse, re-arm and
 	// importPaths (which auto-watches folders in the batch) would resurrect
 	// the folder the user just unwatched.
 	if (!watchedFolders.includes(folder)) return Promise.resolve();
-	if (importInFlight || migrationState) {
+	if (importInFlight || migrationState || driveTransfer) {
 		setTimeout(() => syncWatchedFolder(folder), 5000);
 		return Promise.resolve();
 	}
 	let stat;
 	try {
-		stat = fs.statSync(folder);
+		stat = await fs.promises.stat(folder);
 	} catch {
 		return Promise.resolve();
 	}
@@ -5135,6 +5260,8 @@ async function handleAppRequest(request) {
 		return new Response(body, { status, headers });
 	};
 
+	if (urlPath.startsWith("/map-tiles/")) return loadMapTile(urlPath);
+
 	// Library files (served from memory so imports are atomic)
 	if (urlPath === "/memories-index.json") {
 		const idx = libraryIndex();
@@ -5883,6 +6010,7 @@ function stopRankWorker() {
 // Embed the query through the indexer (unless a caller supplied qVec).
 // Returns Float32Array or null (model down / migration / embed failure).
 async function embedRankQuery(trimmed, dim) {
+	trimmed = await translateSearchQuery(trimmed);
 	try {
 		spawnIndexer();
 		await indexerReady;
@@ -5966,6 +6094,16 @@ async function rankSearchWithVec(queryText, topK, qVecOverride) {
 	return withVec(results || [], Array.from(qVec));
 }
 
+ipcMain.handle("memories:similar-photos", async (_event, filename) => {
+ try {
+  if (migrationState) throw new Error("正在切换搜索模型，请完成后再查找相似照片。");
+  if (typeof filename !== "string") throw new Error("无效的照片。");
+  const matches = await require("./main-lib/similar-photos.js").similarPhotos(loadLibrary(), filename);
+  const remaining = new Set(loadLibrary().filenames);
+  return { ok: true, matches: matches.filter(item => remaining.has(item.filename)) };
+ } catch (error) { return { ok: false, error: error.message }; }
+});
+
 ipcMain.handle("memories:rank", async (_event, query, topK) => {
 	try {
 		return await rankSearchWithVec(query, topK || 96);
@@ -6009,7 +6147,7 @@ async function embedMomentQuery(queryText, qVecOverride) {
 		}
 		if (migrationState) return null;
 		try {
-			const reply = await askIndexer({ type: "embed-query", text: trimmed });
+			const reply = await askIndexer({ type: "embed-query", text: await translateSearchQuery(trimmed) });
 			if (reply.vec && reply.vec.length === l.dim)
 				qVec = new Float32Array(reply.vec);
 		} catch {
@@ -6182,7 +6320,7 @@ ipcMain.handle("memories:embed-query", async (_event, text) => {
 	try {
 		spawnIndexer();
 		await indexerReady;
-		const reply = await askIndexer({ type: "embed-query", text });
+		const reply = await askIndexer({ type: "embed-query", text: await translateSearchQuery(text) });
 		return reply.vec ?? null;
 	} catch {
 		return null;
@@ -6379,8 +6517,44 @@ function removeLibraryRow(filename) {
 	return true;
 }
 
-ipcMain.handle("memories:delete", async (_event, filename) => {
-	if (typeof filename !== "string" || !filename) return { ok: false };
+ipcMain.handle("memories:delete", async (_event, filename, options) => {
+	if (driveTransfer) return { ok: false, error: "正在传输或删除文件，请稍后重试。" };
+ if (migrationState) return { ok: false, error: "正在切换搜索模型，完成后才能删除素材。" };
+ // Imports append complete rows synchronously; deleting an existing row does
+ // not disturb their ordered append cursor. Do not block on importInFlight.
+	if (typeof filename !== "string" || !filename || path.basename(filename) !== filename) return { ok: false };
+ const library = loadLibrary();
+ const row = library.filenames.indexOf(filename);
+ if (row < 0) return { ok: false };
+ // Share the library mutation guard with transfers while awaiting filesystem writes.
+ driveTransfer = new AbortController();
+ try {
+ // Keep watched-folder sync from adding the unchanged original back.
+ const original = library.sources[row];
+ if (options?.original === true) {
+  if (!original || !path.isAbsolute(original)) return { ok: false, error: "没有记录原文件路径，无法删除原文件。" };
+  try {
+   const stat = await fs.promises.lstat(original);
+   if (!stat.isFile()) return { ok: false, error: "原路径不是普通文件，未执行删除。" };
+  } catch (error) { if (error.code !== "ENOENT") return { ok: false, error: "无法读取原文件，未执行删除。" }; }
+ }
+ await persistMovedSource(original);
+ let originalTrashed = false;
+ if (options?.original === true) {
+  try { await fs.promises.lstat(original); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  try {
+   // trashItem uses the original path stored by the importer, never a renderer-supplied path.
+   await shell.trashItem(original); originalTrashed = true;
+  } catch (error) {
+   // A missing source needs only library cleanup; any other trash failure preserves the library.
+   try { await fs.promises.lstat(original); }
+   catch (missing) { if (missing.code === "ENOENT") originalTrashed = true; }
+   if (!originalTrashed) return { ok: false, error: "无法将原文件移到废纸篓，素材库仍保留。请检查文件权限或网盘状态。" };
+  }
+ }
+ try { await fs.promises.unlink(path.join(PHOTOS_DIR, filename)); }
+ catch (error) { if (error.code !== "ENOENT") return { ok: false, error: originalTrashed ? "原文件已移到废纸篓，但素材库副本清理失败，请重试。" : "素材库副本删除失败。" }; }
 	if (!removeLibraryRow(filename)) return { ok: false };
 	await saveLibrary();
 	// Stop the pumps working on the deleted row (queued jobs, tray
@@ -6394,6 +6568,7 @@ ipcMain.handle("memories:delete", async (_event, filename) => {
 	broadcastTranscribeEvent(transcribeSnapshot());
 	broadcastOcrEvent(ocrSnapshot());
 	return { ok: true };
+ } finally { driveTransfer = null; }
 });
 
 // Current AI-engine status, so the renderer can ask on mount instead of
@@ -9981,6 +10156,7 @@ if (!gotTheLock) {
 	// A real quit is underway (Cmd+Q, app-menu Quit, tray Quit item): stand
 	// down the close-to-tray handler so the window is allowed to close.
 	app.on("before-quit", () => {
+		driveTransfer?.abort();
 		isQuitting = true;
 	});
 

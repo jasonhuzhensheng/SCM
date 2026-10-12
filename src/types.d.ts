@@ -27,6 +27,7 @@ export interface WatchedFolder {
 }
 
 export type ImportPhase =
+	| "scanning"
 	| "copying"
 	| "embedding"
 	| "poster"
@@ -418,6 +419,17 @@ export interface AiInsights {
 }
 
 interface MemoriesBridge {
+	photoLocations(names: string[]): Promise<{ locations: { filename: string; lat: number; lng: number }[]; errors: string[] }>;
+	pickTransferFolder(): Promise<{ ok: boolean; canceled?: boolean; error?: string; folderPath?: string; token?: string }>;
+	driveStatus(): Promise<{ ok: boolean; configured?: boolean; connected?: boolean; error?: string }>;
+	driveConfigure(): Promise<{ ok: boolean; configured?: boolean; connected?: boolean; canceled?: boolean; error?: string }>;
+	driveLogin(): Promise<{ ok: boolean; connected?: boolean; error?: string }>;
+	driveDisconnect(): Promise<{ ok: boolean; connected?: boolean; error?: string }>;
+	driveTransfer(options: { filenames: string[]; mode: "copy" | "move"; folderName: string; destination?: "folder"; folderToken?: string }): Promise<{ ok: boolean; error?: string; canceled?: boolean; folderUrl?: string; folderPath?: string; results?: { filename: string; ok: boolean; error?: string; url?: string }[] }>;
+	driveCancel(): Promise<{ ok: boolean }>;
+	onDriveProgress(callback: (progress: { done: number; total: number; filename: string; percent: number }) => void): () => void;
+	translateSearch(text: string): Promise<{ ok: true; text: string } | { ok: false; error: string }>;
+	similarPhotos(filename: string): Promise<{ ok: boolean; error?: string; matches?: {filename: string; score: number}[] }>;
 	embedQuery(text: string): Promise<number[] | null>;
 	/** Rank the library against a query on the main process (no renderer math).
 	 *  M-11 single round-trip: returns an ARRAY with an extra `queryVec`
@@ -502,7 +514,7 @@ interface MemoriesBridge {
 	/** Open a library file in the OS default app (full-file playback for
 	 *  searchable-only video containers the in-app player cannot demux). */
 	openExternal?(filename: string): Promise<{ ok: boolean; error?: string }>;
-	deleteMemory(filename: string): Promise<{ ok: boolean }>;
+	deleteMemory(filename: string, options?: { original?: boolean }): Promise<{ ok: boolean; error?: string }>;
 	/** Pin a photo into (or out of) the Screenshots tab. The decision is
 	 *  keyed by content hash in main and beats every automatic signal;
 	 *  null clears it. The main process broadcasts "library-updated" so the

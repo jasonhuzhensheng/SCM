@@ -890,8 +890,9 @@ async function readChatStream(res, onToken) {
 	return { content: parts.join(""), stopReason: finishReason, timings };
 }
 
-function chatOnce({ messages, modelId, timeoutMs, signal, stream, onToken }) {
+function chatOnce({ messages, modelId, timeoutMs, signal, stream, onToken, maxTokens = 1024 }) {
 	const doChat = async () => {
+		if (signal?.aborted) throw new Error("chat canceled");
 		const port = await ensureServer(modelId);
 		const ctrl = new AbortController();
 		const timer = setTimeout(
@@ -910,7 +911,7 @@ function chatOnce({ messages, modelId, timeoutMs, signal, stream, onToken }) {
 				body: JSON.stringify({
 					messages,
 					temperature: 0.2,
-					max_tokens: 1024,
+					max_tokens: Math.max(1, Math.min(1024, Number(maxTokens) || 1024)),
 					stream: stream === true,
 				}),
 				signal: ctrl.signal,

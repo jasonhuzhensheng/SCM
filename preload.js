@@ -3,6 +3,17 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("memories", {
+	photoLocations: (names) => ipcRenderer.invoke("memories:photo-locations", names),
+	pickTransferFolder: () => ipcRenderer.invoke("memories:pick-transfer-folder"),
+	driveStatus: () => ipcRenderer.invoke("memories:drive-status"),
+	driveConfigure: () => ipcRenderer.invoke("memories:drive-configure"),
+	driveLogin: () => ipcRenderer.invoke("memories:drive-login"),
+	driveDisconnect: () => ipcRenderer.invoke("memories:drive-disconnect"),
+	driveTransfer: (options) => ipcRenderer.invoke("memories:drive-transfer", options),
+	driveCancel: () => ipcRenderer.invoke("memories:drive-cancel"),
+	onDriveProgress: (callback) => { const listener = (_event, data) => callback(data); ipcRenderer.on("memories:drive-progress", listener); return () => ipcRenderer.removeListener("memories:drive-progress", listener); },
+	translateSearch: (text) => ipcRenderer.invoke("memories:translate-search", text),
+	similarPhotos: (filename) => ipcRenderer.invoke("memories:similar-photos", filename),
 	embedQuery: (text) => ipcRenderer.invoke("memories:embed-query", text),
 	rankSearch: (query, topK) => ipcRenderer.invoke("memories:rank", query, topK),
 	rankScenes: (query, topK) =>
@@ -22,7 +33,7 @@ contextBridge.exposeInMainWorld("memories", {
 		ipcRenderer.invoke("memories:reveal-file", filename),
 	openExternal: (filename) =>
 		ipcRenderer.invoke("memories:open-external", filename),
-	deleteMemory: (filename) => ipcRenderer.invoke("memories:delete", filename),
+	deleteMemory: (filename, options) => ipcRenderer.invoke("memories:delete", filename, options),
 	setCategoryOverride: (filename, category) =>
 		ipcRenderer.invoke("memories:set-category-override", filename, category),
 	getIndexerStatus: () => ipcRenderer.invoke("memories:indexer-status"),

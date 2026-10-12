@@ -59,6 +59,7 @@ interface ImportProgress {
 }
 
 const PHASE_LABELS: Record<ImportPhase, string> = {
+	scanning: "Scanning files",
 	copying: "Copying",
 	embedding: "Analyzing with AI",
 	poster: "Generating poster",
@@ -501,6 +502,7 @@ export default function App() {
 			    generous page padding above keeps the tabs and search row
 			    well below the fixed pill instead of sliding underneath. */}
 			<div className="fixed right-4 top-4 z-30 flex items-center gap-2 sm:right-6 sm:top-5">
+				<a href="./" className="rounded-full border border-slate-400/40 bg-white px-3 py-1 text-xs text-slate-700">返回简洁版</a>
 				<button
 					type="button"
 					onClick={() => setSettingsOpen(true)}

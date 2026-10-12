@@ -11,6 +11,8 @@
 		"sharp": "0.33.4"
 	},
 	"scripts": {
+		"preview:simple": "vite --host 127.0.0.1 --port 5173",
+		"package:simple": "node scripts/package-simple.mjs",
 		"build": "vite build",
 		"dev": "bun run build && electron .",
 		"start": "electron .",
@@ -62,6 +64,7 @@
 		"tesseract.js": "7.0.0"
 	},
 	"devDependencies": {
+		"@electron/asar": "^4.3.1",
 		"@eslint/js": "^10.0.1",
 		"@types/react": "^19.0.0",
 		"@types/react-dom": "^19.0.0",
