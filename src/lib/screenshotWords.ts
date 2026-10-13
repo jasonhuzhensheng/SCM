@@ -59,6 +59,9 @@ export const STRONG_SUBSTRINGS: readonly string[] = [
 	"스크린샷", // ko
 	"화면 캡처", // ko (spaced)
 	"화면캡처", // ko (fused)
+	"截图",
+	"螢幕截圖",
+	"萤幕截图",
 	"截屏", // zh-CN (macOS glues the date straight on: 截屏2024-01-15…)
 	"截圖", // zh-TW/HK
 	"屏幕截圖", // zh alternate

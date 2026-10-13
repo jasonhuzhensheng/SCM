@@ -1,0 +1,15 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),ts=require('typescript');
+const source=fs.readFileSync(require('node:path').join(__dirname,'../src/simple/duplicates.ts'),'utf8');
+const ctx={exports:{},Map};vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2020}}).outputText,ctx);
+const find=ctx.exports.findDuplicateGroups,hash='a'.repeat(64),other='b'.repeat(64);
+const assets=[{filename:'one.jpg',sourcePath:'/a/one.jpg',contentHash:hash},{filename:'renamed.png',sourcePath:'/b/renamed.png',contentHash:hash.toUpperCase()},{filename:'one-copy.jpg',sourcePath:'/a/one.jpg',contentHash:hash},{filename:'same-name.jpg',sourcePath:'/c/same-name.jpg',contentHash:other},{filename:'unknown.jpg',sourcePath:'/a/unknown.jpg'}];
+const r=find(assets);assert.equal(r.groups.length,1);assert.equal(r.byFilename.size,2);assert.equal(r.missingHashes,1);assert(!r.byFilename.has('same-name.jpg'));assert.equal(r.byFilename.get('renamed.png').count,2);
+assert.equal(find(assets.filter(a=>a.filename!=='renamed.png')).groups.length,0);
+assert.equal(find([{filename:'bad',sourcePath:'',contentHash:'not-a-hash'}]).groups.length,0);
+console.log('PASS: identical fingerprints group across names, distinct content excluded, same original deduplicated, missing hashes excluded, singleton removed');
+const plan=ctx.exports.duplicateCleanupPlan;
+const groups=[{filenames:['a','b','c']},{filenames:['d','e']}];
+assert.equal(plan(groups,new Set(),new Set(['a','b','c','d','e'])).size,0);
+assert.deepEqual([...plan(groups,new Set(['a','c']),new Set(['b','d','e'])).entries()],[['b','a']]);
+assert.equal(plan(groups,new Set(['a']),new Set(['d','e'])).size,0);
+console.log('PASS: explicit keeper required, all locks preserved, hidden keeper retained, filters constrain deletion');

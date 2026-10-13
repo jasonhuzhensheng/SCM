@@ -275,7 +275,7 @@ const SECTIONS: {
 	{
 		id: "shortcut",
 		label: "Global Shortcut",
-		description: "Focus big2 photo from anywhere",
+		description: "Focus SayPhoto from anywhere",
 		icon: IconCommand,
 		tile: "from-emerald-400 to-teal-600",
 	},
@@ -550,7 +550,7 @@ export default function SettingsSheet({
 		// before the update has no purgeBackground — say so plainly.
 		if (typeof window.memories.purgeBackground !== "function") {
 			onNotify(
-				"This window is from before the purge update — restart big2 photo and try again.",
+				"This window is from before the purge update — restart SayPhoto and try again.",
 				"warning",
 			);
 			return;
@@ -648,7 +648,7 @@ export default function SettingsSheet({
 							Settings
 						</p>
 						<p className="mt-1 text-[20px] font-semibold leading-tight tracking-tight text-zinc-900 dark:text-zinc-50">
-							big2 photo
+							SayPhoto
 						</p>
 					</div>
 					<nav
@@ -753,7 +753,7 @@ export default function SettingsSheet({
 							<div className="mx-auto max-w-[600px] space-y-6">
 								<div className="space-y-4">
 									<p className="text-[13px] leading-relaxed text-zinc-600 dark:text-zinc-400">
-										Choose how big2 photo looks. System follows your Mac&apos;s
+										Choose how SayPhoto looks. System follows your Mac&apos;s
 										appearance and switches automatically.
 									</p>
 									<div
@@ -1622,7 +1622,7 @@ export default function SettingsSheet({
 						{activeSection === "keyboard" && (
 							<div className="mx-auto max-w-[600px] space-y-4">
 								<p className="text-[13px] leading-relaxed text-zinc-600 dark:text-zinc-400">
-									These work anywhere in big2 photo — no setup needed.
+									These work anywhere in SayPhoto — no setup needed.
 								</p>
 								{/* View shortcuts editor: each of the five library
 								    views records its own combo (defaults Cmd+1–5).
@@ -1766,7 +1766,7 @@ export default function SettingsSheet({
 						<p className="hidden shrink-0 text-[12px] text-zinc-400 sm:block dark:text-zinc-500">
 							{videoCostFacts
 								? `${videoCostFacts.videoCount} videos indexed`
-								: "big2 photo Settings"}
+								: "SayPhoto Settings"}
 							{appVersion ? ` · v${appVersion}` : ""}
 						</p>
 					</div>

@@ -1,0 +1,74 @@
+'use strict';
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const vm = require('node:vm');
+(async () => {
+ const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayphoto-background-'));
+ const file = path.join(dir, 'failed-imports.json');
+ const initial = Object.fromEntries(Array.from({length: 200000}, (_, i) => [`/offline/photo-${i}.jpg`, {count:3,size:10,mtimeMs:20}]));
+ fs.writeFileSync(file, JSON.stringify({version:1,failed:initial}));
+ const cache = require('../main-lib/failed-imports');
+ cache.initFailedImports({dataDir:dir});
+ const originals = {existsSync:fs.existsSync,statSync:fs.statSync,rename:fs.promises.rename};
+ try {
+  // No synchronous metadata walk on startup or per-file cache checks.
+  fs.existsSync = () => {throw Error('unexpected sync existence check');};
+  fs.statSync = () => {throw Error('unexpected sync stat');};
+  assert.equal(Object.keys(cache.loadFailedImports()).length,200000);
+  assert.equal(cache.isKnownImportFailure('/offline/photo-1.jpg',{size:10,mtimeMs:20}),true);
+  assert.equal(cache.isKnownImportFailure('/offline/photo-2.jpg',{size:11,mtimeMs:20}),false);
+  assert.equal(cache.isKnownImportFailure('/offline/photo-3.jpg',null),false);
+  let renames=0;
+  fs.promises.rename=async(...args)=>{renames++;return originals.rename(...args);};
+  for(let i=0;i<1000;i++) cache.rememberImportFailure('/new/photo.jpg',{size:1,mtimeMs:2});
+  assert.equal(renames,0,'mutations must coalesce rather than save per failure');
+  let beats=0; const timer=setInterval(()=>beats++,1);
+  const started=performance.now();
+  const writing=cache.saveFailedImports();
+  // Changes during a checkpoint must reach disk at explicit drain.
+  await new Promise(resolve=>setImmediate(resolve));
+  cache.retireImportFailure('/offline/photo-1.jpg');
+  cache.rememberImportFailure('/during-write.jpg',{size:3,mtimeMs:4});
+  await writing; await cache.flushFailedImports(); clearInterval(timer);
+  const persisted=JSON.parse(fs.readFileSync(file));
+  assert.equal(persisted.failed['/new/photo.jpg'].count,1000);
+  assert.equal(persisted.failed['/during-write.jpg'].count,1);
+  assert.equal(persisted.failed['/offline/photo-1.jpg'],undefined);
+  assert.equal(persisted.failed['/offline/photo-2.jpg'],undefined);
+  assert.equal(persisted.failed['/offline/photo-3.jpg'],undefined);
+  assert.equal(renames,2);assert(beats>10,'large checkpoints must yield to the event loop');
+  console.log(`PASS: 200k cached failures, 1000 updates coalesced, concurrent mutations retained; ${beats} heartbeats during ${(performance.now()-started).toFixed(0)}ms save`);
+  const lastGood=fs.readFileSync(file);
+  cache.rememberImportFailure('/after-failure.jpg',{size:5,mtimeMs:6});
+  fs.promises.rename=async()=>{throw Error('injected disk failure');};
+  await assert.rejects(cache.flushFailedImports(),/injected disk failure/);
+  assert(fs.readFileSync(file).equals(lastGood),'failed checkpoint preserves last valid cache');
+  fs.promises.rename=originals.rename;
+  await cache.flushFailedImports();
+  assert.equal(JSON.parse(fs.readFileSync(file)).failed['/after-failure.jpg'].count,1);
+  cache.rememberImportFailure('/before-reset.jpg',{size:5,mtimeMs:6});
+  const pending=cache.saveFailedImports();
+  await cache.clearFailedImports();await pending;
+  assert.deepEqual(JSON.parse(fs.readFileSync(file)).failed,{});
+  assert(!fs.readdirSync(dir).some(name=>name.includes('.tmp-')));
+  console.log('PASS: atomic failure recovery, drain, and reset while saving');
+ } finally {
+  fs.existsSync=originals.existsSync;fs.statSync=originals.statSync;fs.promises.rename=originals.rename;
+  fs.rmSync(dir,{recursive:true,force:true});
+ }
+ const source=fs.readFileSync(path.join(__dirname,'../main.js'),'utf8');
+ const start=source.indexOf('function enqueueOcr('),end=source.indexOf('// Re-queue every photo',start);
+ const names=Array.from({length:90000},(_,i)=>`p${i}.jpg`);
+ const library={filenames:names,ocrWords:names.map(()=>null),ocr:names.map(()=>null)};
+ const context={loadLibrary:()=>library,ocrQueue:[],ocrTotalCount:0,broadcastOcrEvent(){},scheduleOcr(){}};
+ vm.createContext(context);vm.runInContext(source.slice(start,end),context);
+ const begin=performance.now();
+ assert.equal(context.enqueueOcr(names,{force:true}),90000);
+ assert.equal(context.enqueueOcr(names,{force:true}),0);
+ context.ocrQueue.shift();assert.equal(context.enqueueOcr([names[0],names[0],'unknown'],{force:true}),1);
+ context.ocrQueue=[];library.ocrWords[0]=[];library.ocrWords[1]=[{text:'ok'}];
+ assert.equal(context.enqueueOcr(names.slice(0,3)),1,'healthy and text-free rows stay skipped');
+ console.log(`PASS: 90k OCR queue dedupe, removed job requeue, healthy-row handling (${(performance.now()-begin).toFixed(0)}ms)`);
+})().catch(error=>{console.error(error);process.exitCode=1;});

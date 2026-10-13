@@ -1,0 +1,30 @@
+'use strict';
+const assert = require('node:assert/strict');
+const { createImportPacer } = require('../main-lib/import-pacer');
+
+(async () => {
+	let time = 0, turns = 0, enabled = 0, disabled = 0, resets = 0;
+	const sleeps = [];
+	const histogram = { max: 20e6, enable() { enabled++; }, disable() { disabled++; }, reset() { resets++; this.max = 20e6; } };
+	const options = { now: () => time, monitor: () => histogram, yieldTurn: async () => { turns++; }, sleep: async ms => { sleeps.push(ms); } };
+	const pacer = createImportPacer(true, options);
+	await pacer.wait();
+	assert.equal(enabled, 1);
+	assert.deepEqual(sleeps, [], 'healthy event loop has no fixed per-file delay');
+	histogram.max = 65e6;
+	await pacer.wait();
+	histogram.max = 500e6;
+	time = 1001;
+	await pacer.wait();
+	assert.deepEqual(sleeps, [65, 100], 'busy loop backs off, bounded to 100ms');
+	await pacer.wait();
+	assert.equal(resets, 1);
+	assert.equal(sleeps.length, 2, 'old lag decays after reset');
+	pacer.close();
+	assert.equal(disabled, 1);
+	const manual = createImportPacer(false, options);
+	await manual.wait(); manual.close();
+	assert.equal(enabled, 1, 'manual import does not enable background monitor');
+	assert.equal(turns, 5, 'every file yields to IPC and I/O');
+	console.log('PASS: responsive import pacing, bounded backoff, recovery and cleanup');
+})().catch(error => { console.error(error); process.exitCode = 1; });

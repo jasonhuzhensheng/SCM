@@ -212,7 +212,7 @@ export default function CrtTv({ channel, onChannel }: CrtTvProps) {
 							loop
 							muted
 							playsInline
-							aria-label="big2 photo app demo video"
+							aria-label="SayPhoto app demo video"
 						/>
 						<div className="crt-flash" aria-hidden="true" />
 						<div className="crt-static" aria-hidden="true" />
@@ -246,7 +246,7 @@ export default function CrtTv({ channel, onChannel }: CrtTvProps) {
 				<div className="crt-badge">
 					<span className="crt-brand">Screen&nbsp;Memory</span>
 					<span className="crt-model" aria-hidden="true">
-						big2 photo–01
+						SayPhoto–01
 					</span>
 				</div>
 

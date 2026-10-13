@@ -56,6 +56,14 @@ if (process.parentPort) {
 			process.exit(0);
 			return;
 		}
+		if (msg.type === "sync-live") {
+			try {
+				if (msg.live.offset === 0) { resetLibraryCaches(); cachedGen = null; }
+				liveCache.apply(msg.live);
+				post({type:"sync-live",id:msg.id,ok:true,results:null});
+			} catch (err) { post({type:"sync-live",id:msg.id,ok:false,error:err.message}); }
+			return;
+		}
 		if (msg.type === "rank" || msg.type === "rank-live") {
 			const id = msg.id;
 			try {

@@ -14,6 +14,7 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scm-stores-"));
 failed.initFailedImports({ dataDir: dir });
 cto.initCategoryOverrides({ dataDir: dir });
 
+(async () => {
 // ---- failed imports ----
 assert.deepEqual(failed.loadFailedImports(), {});
 assert.equal(
@@ -54,6 +55,7 @@ fs.unlinkSync(gone);
 assert.equal(failed.isKnownImportFailure(gone), false);
 // Persistence round-trip across a fresh module state is covered by the
 // failcache smoke suite; here just assert the file was written.
+await failed.flushFailedImports();
 assert.ok(fs.existsSync(path.join(dir, "failed-imports.json")));
 
 // ---- category overrides ----
@@ -63,3 +65,5 @@ assert.ok(cto.CATEGORY_OVERRIDE_VALUES.has("Projects"));
 assert.equal(cto.CATEGORY_OVERRIDE_VALUES.size, 2);
 
 console.log("stores: all assertions passed");
+
+})().catch(error => { console.error(error); process.exitCode = 1; });

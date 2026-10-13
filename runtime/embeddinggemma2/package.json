@@ -1,0 +1,6 @@
+{
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1"
+  },
+  "private": true
+}

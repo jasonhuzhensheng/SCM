@@ -88,13 +88,25 @@ function createGoogleDrive({userDataDir,safeStorage,openExternal,fetchImpl=fetch
   const r=await request(API+'/files?fields=id,name,webViewLink',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,mimeType:'application/vnd.google-apps.folder'}),signal});
   return r.json();
  }
- async function upload(file,name,parent,signal,onProgress=()=>{}){
+ async function upload(file,name,parent,signal,onProgress=()=>{}, checkpoint=null, saveCheckpoint=()=>{}){
   const stat=await fs.promises.stat(file);if(!stat.isFile()||stat.size===0)throw new Error('文件不存在或为空。');
   const md5=await digest(file,signal);signal?.throwIfAborted();
-  const init=await request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum,webViewLink',{method:'POST',headers:{'Content-Type':'application/json','X-Upload-Content-Type':'application/octet-stream','X-Upload-Content-Length':String(stat.size)},body:JSON.stringify({name,parents:[parent]}),signal});
-  const session=init.headers.get('location');
+  if(checkpoint?.md5 && (checkpoint.md5!==md5||checkpoint.size!==stat.size))throw Error('源文件已变化，不能续传');
+  let session=checkpoint?.session;
+  if(!session){
+   const init=await request('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,size,md5Checksum,webViewLink',{method:'POST',headers:{'Content-Type':'application/json','X-Upload-Content-Type':'application/octet-stream','X-Upload-Content-Length':String(stat.size)},body:JSON.stringify({name,parents:[parent]}),signal});
+   session=init.headers.get('location');
+   if(checkpoint){Object.assign(checkpoint,{session,md5,size:stat.size});saveCheckpoint();}
+  }
   if(!session||new URL(session).origin!=='https://www.googleapis.com')throw new Error('Google 返回了无效的上传地址。');
-  const handle=await fs.promises.open(file,'r');let offset=0,result;
+  let offset=0,result=checkpoint?.result;
+  if(result)offset=stat.size;
+  else if(checkpoint){
+   const r=await request(session,{method:'PUT',headers:{'Content-Length':'0','Content-Range':`bytes */${stat.size}`},signal});
+   if(r.status===308){const match=/bytes=0-(\d+)/.exec(r.headers.get('range')||'');offset=match?Number(match[1])+1:0;}
+   else{result=await r.json();offset=stat.size;checkpoint.result=result;saveCheckpoint();}
+  }
+  const handle=await fs.promises.open(file,'r');
   try{
    while(offset<stat.size){
     signal?.throwIfAborted();
@@ -109,7 +121,7 @@ function createGoogleDrive({userDataDir,safeStorage,openExternal,fetchImpl=fetch
      if(r.status===308){const match=/bytes=0-(\d+)/.exec(r.headers.get('range')||'');const committed=match?Number(match[1])+1:0;if(committed<=offset)throw error;offset=committed;onProgress(offset,stat.size);continue;}
     }
     if(r.status===308){const match=/bytes=0-(\d+)/.exec(r.headers.get('range')||'');const next=match?Number(match[1])+1:0;if(next<=offset||next>stat.size)throw new Error('上传进度异常，保留本地文件。');offset=next;}
-    else{result=await r.json();offset=stat.size;}
+    else{result=await r.json();offset=stat.size;if(checkpoint){checkpoint.result=result;saveCheckpoint();}}
     onProgress(offset,stat.size);
    }
   }finally{await handle.close();}

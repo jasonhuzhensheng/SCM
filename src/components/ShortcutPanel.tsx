@@ -15,7 +15,7 @@ interface ShortcutPanelProps {
 // displayShortcut) — shared with the Keyboard view-shortcut editor so the
 // recorder and the grid matcher can never drift apart.
 // The "Global Shortcut" section inside the Settings sheet. Records a
-// user-chosen keyboard shortcut that brings the big2 photo window to focus
+// user-chosen keyboard shortcut that brings the SayPhoto window to focus
 // even when it's in the background (Electron globalShortcut API).
 export default function ShortcutPanel({
 	onNotify,
@@ -93,7 +93,7 @@ export default function ShortcutPanel({
 							Global Shortcut
 						</p>
 						<p className="truncate text-[13px] text-zinc-500 dark:text-zinc-400">
-							Bring big2 photo to focus from anywhere
+							Bring SayPhoto to focus from anywhere
 						</p>
 					</div>
 				</div>
@@ -130,7 +130,7 @@ export default function ShortcutPanel({
 					<>
 						<p className="text-[13px] leading-relaxed text-zinc-600 dark:text-zinc-400">
 							Press a key combination anywhere on your Mac to bring this window
-							to the front — even when big2 photo is in the background.
+							to the front — even when SayPhoto is in the background.
 						</p>
 
 						{current && !conflictError && (

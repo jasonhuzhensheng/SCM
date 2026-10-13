@@ -1,0 +1,37 @@
+"use strict";
+const assert = require("node:assert/strict"), fs = require("node:fs"), os = require("node:os"), path = require("node:path"), vm = require("node:vm");
+const {createAssetLocks} = require("../main-lib/asset-locks");
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "asset-lock-test-"));
+(async () => { try {
+ const file = path.join(dir, "locks.json"), locks = createAssetLocks(file);
+ assert.deepEqual(locks.list(), []);
+ locks.set(["a.jpg", "b.mp4", "a.jpg"], true);
+ assert.deepEqual(createAssetLocks(file).list(), ["a.jpg", "b.mp4"]);
+ locks.set(["a.jpg"], false); assert.equal(locks.has("a.jpg"), false);
+ assert.equal(locks.has("b.mp4"), true);
+ assert.throws(() => locks.set(["../escape"], true));
+ fs.mkdirSync(file + ".tmp"); assert.throws(() => locks.set(["c.jpg"], true));
+ assert.equal(locks.has("c.jpg"), false); assert.deepEqual(createAssetLocks(file).list(), ["b.mp4"]); fs.rmdirSync(file + ".tmp");
+ const handlers = new Map(), source = fs.readFileSync(path.join(__dirname, "../main.js"), "utf8");
+ const ctx = vm.createContext({assetLocks:locks, ipcMain:{handle:(n,f)=>handlers.set(n,f)}, readSettings:()=>({}), AbortController, path, loadLibrary:()=>({filenames:["a.jpg","b.mp4"]}), migrationState:false});
+ const load = (start,end) => {const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a);vm.runInContext(source.slice(a,b),ctx);};
+ load('let driveTransfer = null;', 'const movedSourcesFile');
+ load('ipcMain.handle("memories:delete",', '\n//');
+ for(const original of [true,false]) assert.match((await handlers.get('memories:delete')(null,'b.mp4',{original})).error,/锁定/);
+ const set = handlers.get('memories:set-asset-locks');
+ assert.equal(set(null,['absent.jpg'],true).ok,false);
+ assert.equal(set(null,['a.jpg','b.mp4'],true).ok,true);
+ vm.runInContext('driveTransfer = new AbortController()',ctx);
+ assert.equal(set(null,['a.jpg'],false).ok,false);
+ vm.runInContext('driveTransfer = null',ctx);
+ ctx.driveReply=async task=>{try{return {ok:true,...await task()};}catch(e){return {ok:false,error:e.message};}};
+ ctx.drive={status:()=>({connected:true})};
+ load('ipcMain.handle("memories:drive-transfer",','\n// App icon');
+ assert.match((await handlers.get('memories:drive-transfer')(null,{mode:'move',filenames:['a.jpg','b.mp4']})).error,/锁定/);
+ load('ipcMain.handle("memories:library-reset",','\n//');
+ assert.match((await handlers.get('memories:library-reset')()).error,/锁定/);
+ assert.equal(set(null,['a.jpg','b.mp4'],false).ok,true); assert.deepEqual(locks.list(),[]);
+ fs.writeFileSync(file,'bad');assert.throws(()=>createAssetLocks(file).has('a.jpg'));
+ console.log('PASS: persistent per-asset locks, batch/unlock, failed writes, corrupt store fails closed, IPC deletion/move/reset and busy guards');
+ } finally {fs.rmSync(dir,{recursive:true,force:true});}
+})().catch(e=>{console.error(e);process.exitCode=1;});

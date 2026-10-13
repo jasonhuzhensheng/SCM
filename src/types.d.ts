@@ -1,4 +1,17 @@
+export interface PersonFace {
+ id:string;key:string;assetID:string;filename:string;video:boolean;time:number;
+ bounds:{x:number;y:number;width:number;height:number};
+}
+export interface PersonFacesPage {personID:string;total:number;offset:number;faces:PersonFace[];revision:number;}
+export interface PersonGroup {
+ id: string; number: number; name: string; aliases: string[]; files: string[]; review: boolean;
+ representative: {filename:string;video:boolean;time:number;bounds:{x:number;y:number;width:number;height:number}};
+}
+export interface PeopleStatus {
+ supported:boolean;running:boolean;paused:boolean;done:number;total:number;failed:number;phase:string;error:string;revision:number;people?:PersonGroup[];
+}
 export interface ApplePhotosStatus {
+ referenceOnly: boolean;
  supported: boolean; enabled: boolean; phase: string; indexed: number; total: number;
  failed: number; error: string; limited: boolean; lastSync: string | null;
 }
@@ -133,6 +146,8 @@ export type StatusPayload =
 	  }
 	| {
 			type: "import";
+            paused?: boolean;
+            active?: boolean;
 			phase: ImportPhase;
 			filename: string;
 			done?: number;
@@ -423,7 +438,29 @@ export interface AiInsights {
 }
 
 interface MemoriesBridge {
+	copyCleanupStatus(): Promise<{running:boolean;done:number;total:number;converted:number;bytes:number;reasons:Record<string,number>;error:string;cancelled:boolean}>;
+	copyCleanupStart(): Promise<{ok:boolean;error?:string;cancelled?:boolean}>;
+	copyCleanupCancel(): Promise<unknown>;
 	fileSizes(names: string[]): Promise<{ filename: string; size: number | null }[]>;
+	peopleStatus(revision?: number): Promise<PeopleStatus>;
+ peopleStart(): Promise<PeopleStatus>;
+ peoplePause(): Promise<PeopleStatus>;
+ peopleMerge(ids: string[], targetID: string): Promise<PeopleStatus>;
+ peopleFaces(id: string, offset?: number): Promise<PersonFacesPage>;
+ peopleMoveFaces(id: string, keys: string[]): Promise<PeopleStatus & {movedTo:string}>;
+ peopleFaceThumbnail(id: string, key: string): Promise<string>;
+ peopleRename(id: string, name: string): Promise<PeopleStatus>;
+ deletionSpaceHistory(): Promise<{totals:{trashedCount:number;trashedBytes:number}}>;
+ fileTasks(): Promise<Array<{id:string;kind:string;status:string;done:number;total:number;error?:string;mode?:"copy"|"move";filename?:string;destination?:string;repairOriginals?:boolean;succeeded?:number;failed?:number}>>;
+ pauseFileTask(id:string): Promise<unknown>;
+ resumeFileTask(id:string): Promise<unknown>;
+ drivePause(): Promise<{ok:boolean}>;
+ cancelFileTask(id:string): Promise<unknown>;
+ deleteBatch(entries:Array<{filename:string;original:boolean;duplicateKeeper?:string}>): Promise<{ok:boolean;error?:string;canceled?:boolean;results?:Array<{filename:string;ok:boolean;error?:string}>}>;
+ taskCheckpoint(key: "quality" | "ai-origin", value?: { pending: boolean; names: string[]; forced: string[] }): Promise<{ pending: boolean; names: string[]; forced: string[] } | null>;
+ photoQuality(names: string[], options?: { cachedOnly?: boolean; force?: boolean }): Promise<Record<string, { score?: number; error?: string }>>;
+ aiOrigins(names: string[], options?: { cachedOnly?: boolean; refresh?: boolean }): Promise<Record<string, { status: "marked" | "suspected" | "unknown" | "error"; evidence: string; failed?: boolean }>>;
+ captureDevices(names: string[], options?: { cachedOnly?: boolean }): Promise<Record<string, { brand: string; model: string; status: string }>>;
 	photoLocations(names: string[]): Promise<{ locations: { filename: string; lat: number; lng: number }[]; errors: string[] }>;
 	detectionSearch(kind: "qr" | "barcode" | "text", query?: string): Promise<{ok:boolean; error?:string; filenames?:string[]; status?:{total:number; indexed:number; pending:number; failed:number; paused:boolean; reconciling:boolean}}>;
  detectionPause(paused:boolean): Promise<{ok:boolean; error?:string}>;
@@ -433,7 +470,7 @@ interface MemoriesBridge {
 	driveConfigure(): Promise<{ ok: boolean; configured?: boolean; connected?: boolean; canceled?: boolean; error?: string }>;
 	driveLogin(): Promise<{ ok: boolean; connected?: boolean; error?: string }>;
 	driveDisconnect(): Promise<{ ok: boolean; connected?: boolean; error?: string }>;
-	driveTransfer(options: { filenames: string[]; mode: "copy" | "move"; folderName: string; destination?: "folder"; folderToken?: string }): Promise<{ ok: boolean; error?: string; canceled?: boolean; folderUrl?: string; folderPath?: string; results?: { filename: string; ok: boolean; error?: string; url?: string }[] }>;
+	driveTransfer(options: { filenames: string[]; mode: "copy" | "move"; folderName: string; destination?: "folder"; folderToken?: string }): Promise<{ ok: boolean; error?: string; paused?: boolean; canceled?: boolean; folderUrl?: string; folderPath?: string; results?: { filename: string; ok: boolean; error?: string; url?: string }[] }>;
 	driveCancel(): Promise<{ ok: boolean }>;
 	onDriveProgress(callback: (progress: { done: number; total: number; filename: string; percent: number }) => void): () => void;
 	translateSearch(text: string): Promise<{ ok: true; text: string } | { ok: false; error: string }>;
@@ -511,6 +548,8 @@ interface MemoriesBridge {
 	getTranscribeState?(): Promise<StatusPayload | null>;
 	importPaths(paths: string[]): Promise<ImportResult>;
 	pickPhotos(): Promise<ImportResult | null>;
+ getImportState(): Promise<Extract<StatusPayload, {type:"import"}>>;
+ setImportPaused(paused:boolean): Promise<Extract<StatusPayload, {type:"import"}>>;
  applePhotosStatus(): Promise<ApplePhotosStatus>;
  applePhotosConnect(): Promise<ApplePhotosStatus>;
  applePhotosPause(): Promise<ApplePhotosStatus>;
@@ -527,7 +566,11 @@ interface MemoriesBridge {
 	/** Open a library file in the OS default app (full-file playback for
 	 *  searchable-only video containers the in-app player cannot demux). */
 	openExternal?(filename: string): Promise<{ ok: boolean; error?: string }>;
-	deleteMemory(filename: string, options?: { original?: boolean }): Promise<{ ok: boolean; error?: string }>;
+	getAssetLocks(): Promise<string[]>;
+		setAssetLocks(names: string[], locked: boolean): Promise<{ok: boolean; filenames?: string[]; error?: string}>;
+		getFileLock(): Promise<boolean>;
+	setFileLock(locked: boolean): Promise<{ok: boolean; locked?: boolean; error?: string}>;
+	deleteMemory(filename: string, options?: { original?: boolean; duplicateKeeper?: string }): Promise<{ ok: boolean; error?: string }>;
 	/** Pin a photo into (or out of) the Screenshots tab. The decision is
 	 *  keyed by content hash in main and beats every automatic signal;
 	 *  null clears it. The main process broadcasts "library-updated" so the

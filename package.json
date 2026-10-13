@@ -3,7 +3,7 @@
 	"version": "0.2.7",
 	"private": true,
 	"license": "MIT",
-	"description": "big2 photo — 飞快找图，本地照片与视频搜索",
+	"description": "SayPhoto 说图 · by Big2 — 说句话，照片就找到。",
 	"author": "Allen Lee",
 	"main": "main.js",
 	"packageManager": "bun@1.3.14",
@@ -55,7 +55,10 @@
 		"test:decode-ahead": "node test/decode-ahead.test.js",
 		"test:raw-frame-parity": "node test/raw-frame-parity.test.js",
 		"build:qr": "swiftc -O main-lib/native/qr-detector.swift -o main-lib/native/qr-detector",
-		"build:photos-bridge": "swiftc -O -module-cache-path /tmp/fly-photo-swift-cache native/apple-photos.swift -o main-lib/native/apple-photos-bridge -framework Photos -framework CryptoKit"
+		"build:photo-quality": "swiftc -parse-as-library -O -module-cache-path /tmp/sayphoto-quality-swift-cache native/photo-quality.swift -o main-lib/native/photo-quality -framework Vision -framework ImageIO",
+		"build:face-groups": "swiftc -parse-as-library -O -module-cache-path /tmp/sayphoto-face-swift-cache native/face-groups.swift -o main-lib/native/face-groups -framework MediaIntelligence -framework AVFoundation -framework ImageIO",
+		"build:photos-bridge": "swiftc -O -module-cache-path /tmp/fly-photo-swift-cache native/apple-photos.swift -o main-lib/native/apple-photos-bridge -framework Photos -framework CryptoKit",
+		"install:embeddinggemma2": "npm ci --prefix runtime/embeddinggemma2 --no-audit --no-fund"
 	},
 	"dependencies": {
 		"@huggingface/transformers": "3.8.1",
@@ -87,7 +90,7 @@
 	},
 	"build": {
 		"appId": "com.allenv0.scm",
-		"productName": "big2 photo",
+		"productName": "SayPhoto",
 		"compression": "maximum",
 		"electronDist": "node_modules/electron/dist",
 		"electronLanguages": [
@@ -111,6 +114,8 @@
 			"node_modules/tesseract.js-core/**"
 		],
 		"extraResources": [
+			{"from": "main-lib/native/photo-quality", "to": "photo-quality"},
+			{"from": "main-lib/native/face-groups", "to": "face-groups"},
 			{
 				"from": "node_modules/ffmpeg-static/ffmpeg",
 				"to": "ffmpeg"
@@ -122,6 +127,10 @@
 			{
 				"from": "main-lib/native/apple-photos-bridge",
 				"to": "apple-photos-bridge"
+			},
+			{
+				"from": "runtime/embeddinggemma2",
+				"to": "embeddinggemma2"
 			}
 		],
 		"directories": {
@@ -133,13 +142,13 @@
 				"zip"
 			],
 			"category": "public.app-category.photography",
-			"icon": "public/images/icns/SCM.icns",
+			"icon": "public/brand/SayPhoto.icns",
 			"extendInfo": {
-				"NSPhotoLibraryUsageDescription": "big2 photo需要读取您的照片图库，以便自动同步新增照片、建立本地搜索索引。"
+				"NSPhotoLibraryUsageDescription": "SayPhoto 需要访问您的照片图库以建立本地搜索索引，并在您确认后将核对过的照片或视频移入“最近删除”。"
 			}
 		},
 		"dmg": {
-			"title": "big2 photo"
+			"title": "SayPhoto 说图 · by Big2"
 		}
 	}
 }

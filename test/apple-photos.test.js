@@ -16,7 +16,7 @@ const { createApplePhotos } = require('../main-lib/apple-photos');
  const options = { directory, platform:'darwin', bridge, busy:()=>blocked, importFiles:async paths=> { imports.push(paths); return { errors:importFail ? [{error:'disk full'}] : [], added:paths, skipped:[] }; } };
  const controller = createApplePhotos(options);
  try {
-  await assert.rejects(controller.connect(), /允许big2 photo/);
+  await assert.rejects(controller.connect(), /允许.*访问全部照片/);
   assert.equal(controller.snapshot().enabled,false);
   authorized = true; blocked = true;
   await controller.connect(); assert.equal(controller.snapshot().phase,'waiting');

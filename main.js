@@ -84,6 +84,7 @@ const {
 } = require("./main-lib/settings.js");
 const {
 	initFailedImports,
+	flushFailedImports,
 	failedImportsFile,
 	isSystemIndexerError,
 	rememberImportFailure,
@@ -186,8 +187,8 @@ const SCHEME = "app";
 // Keep the existing library, caches and single-instance lock when the display
 // name changes. Tests can still isolate all state in a scratch directory.
 app.setPath("userData", process.env.MEMORIES_DATA_DIR || path.join(app.getPath("appData"), "scm"));
-app.setName("big2 photo");
-app.setAboutPanelOptions({ applicationName: "big2 photo" });
+app.setName("SayPhoto");
+app.setAboutPanelOptions({ applicationName: "SayPhoto" });
 
 // ---------------------------------------------------------------------------
 // Persistent file logging: the packaged app's stdout goes nowhere on macOS,
@@ -253,7 +254,7 @@ function initFileLogging() {
 				}
 			};
 		}
-		stream.write(`${stamp()} [log] --- big2 photo start (pid ${process.pid}) ---\n`);
+		stream.write(`${stamp()} [log] --- SayPhoto start (pid ${process.pid}) ---\n`);
 	} catch {
 		/* file logging unavailable; console still works */
 	}
@@ -288,11 +289,12 @@ initLlmServer({
 });
 
 const { createSearchTranslator } = require("./main-lib/search-translation.js");
-const translateSearchQuery = createSearchTranslator({
+const translateLegacySearchQuery = createSearchTranslator({
 	chat: llmChat,
 	getModelId: () => readLlmConfig().chatModel,
 	isAvailable: modelId => llmBinaryDownloaded() && llmModelDownloaded(modelId),
 });
+const translateSearchQuery = text => getModel(loadLibrary().modelId)?.nativeMultilingual ? Promise.resolve(String(text)) : translateLegacySearchQuery(text);
 ipcMain.handle("memories:translate-search", async (_event, text) => {
 	try { return { ok: true, text: await translateSearchQuery(text) }; }
 	catch (error) { return { ok: false, error: error.message || "中文翻译失败，请重试。" }; }
@@ -303,7 +305,30 @@ const drive = require("./main-lib/google-drive.js").createGoogleDrive({
 	userDataDir: app.getPath("userData"), safeStorage: require("electron").safeStorage,
 	openExternal: url => shell.openExternal(url),
 });
+const assetLocks = require("./main-lib/asset-locks.js").createAssetLocks(path.join(app.getPath("userData"), "asset-locks.json"));
 let driveTransfer = null;
+const FILE_LOCK_ERROR = "文件已锁定，只可搜索、预览和复制；请先解除文件锁定。";
+const filesLocked = () => readSettings().filesLocked === true;
+ipcMain.handle("memories:get-file-lock", () => filesLocked());
+ipcMain.handle("memories:set-file-lock", (_event, locked) => {
+	if (typeof locked !== "boolean") return { ok: false, error: "无效的锁定状态。" };
+	// Never report a lock while an earlier destructive operation is still running.
+	if (driveTransfer) return { ok: false, error: "请等待文件传输、删除或副本清理结束后再切换锁定。" };
+	try {
+		writeSettings({ filesLocked: locked });
+		if (filesLocked() !== locked) throw new Error("保存失败");
+		return { ok: true, locked };
+	} catch { return { ok: false, error: "无法保存文件锁定状态，请重试。" }; }
+});
+ipcMain.handle("memories:get-asset-locks", () => assetLocks.list());
+ipcMain.handle("memories:set-asset-locks", (_event, names, locked) => {
+ try {
+  if (driveTransfer) throw Error("请等待文件传输、删除或副本清理完成。");
+  const known = new Set(loadLibrary().filenames);
+  if (typeof locked !== "boolean" || !Array.isArray(names) || !names.length || names.some(name => !known.has(name))) throw Error("选择包含无效素材，请重新选择。");
+  return {ok:true, filenames:assetLocks.set(names, locked)};
+ } catch (error) { return {ok:false, error:error.message}; }
+});
 const movedSourcesFile = path.join(app.getPath("userData"), "drive-moved-sources.json");
 let movedSources = {};
 try { movedSources = JSON.parse(fs.readFileSync(movedSourcesFile, "utf8")); } catch { /* first run */ }
@@ -320,7 +345,7 @@ async function wasMovedToDrive(source) {
 	const record = movedSources[source]; if (!record) return false;
 	try { const stat = await fs.promises.stat(source); return stat.size === record.size && stat.mtimeMs === record.mtimeMs; } catch { return false; }
 }
-const driveReply = async task => { try { return { ok: true, ...await task() }; } catch (error) { return { ok: false, error: error.message || "Google Drive 操作失败。" }; } };
+const driveReply = async task => { try { return { ok: true, ...await task() }; } catch (error) { return { ok: false, error: error.message || "文件操作失败。", ...(Array.isArray(error.results)?{results:error.results}:{}) }; } };
 let selectedTransferFolder = null;
 ipcMain.handle("memories:pick-transfer-folder", () => driveReply(async () => {
  if (driveTransfer) throw new Error("请等待当前传输完成。");
@@ -370,61 +395,258 @@ ipcMain.handle("memories:qr-scan", (_event, names, kind="qr") => {
  try { if(!Array.isArray(names))throw new Error("无效请求");const wanted=new Set(names);return {ok:true,...getDetectionIndex().search(kind),filenames:getDetectionIndex().search(kind).filenames.filter(name=>wanted.has(name))}; }
  catch(error){return {ok:false,error:error.message};}
 });
-ipcMain.handle("memories:drive-cancel", () => { driveTransfer?.abort(); return { ok: true }; });
-ipcMain.handle("memories:drive-transfer", (event, options) => driveReply(async () => {
-	if (driveTransfer) throw new Error("正在传输或删除文件，请等待当前操作结束。");
-	if (migrationState) throw new Error("正在切换搜索模型，请等待索引切换完成后重试。");
-	// Only committed library rows can be selected below. Imports append complete
-	// rows synchronously, and removal resolves the current row by filename, just
-	// like memories:delete. An unrelated import batch must not block transfers.
-	const localFolder = options?.destination === "folder";
- const destination = localFolder && selectedTransferFolder?.token === options.folderToken ? selectedTransferFolder.directory : null;
- if (localFolder && !destination) throw new Error("请重新选择目标文件夹。");
- if (!localFolder && !drive.status().connected) throw new Error("请先在设置中连接 Google Drive。");
-	if (!Array.isArray(options?.filenames) || !["copy", "move"].includes(options?.mode)) throw new Error("无效的传输请求。");
-	const names = [...new Set(options.filenames)];
-	const l = loadLibrary();
-	if (!names.length || names.length > 10000 || names.some(name => typeof name !== "string" || path.basename(name) !== name || !l.filenames.includes(name))) throw new Error("选择包含无效素材，请重新选择。");
-	const folderName = String(options.folderName || "big2 photo 搜索结果").trim().slice(0, 160);
-	const controller = new AbortController(); driveTransfer = controller;
-	const results = []; let folder;
-	const emit = payload => { if (!event.sender.isDestroyed()) event.sender.send("memories:drive-progress", payload); };
-	try {
-		folder = localFolder
-   ? { localPath: await fs.promises.mkdtemp(path.join(destination, "big2 photo 搜索结果-")) }
-   : await drive.createFolder(folderName, controller.signal);
-		for (const filename of names) {
-			if (controller.signal.aborted) break;
-			try {
-				const i = l.filenames.indexOf(filename); if (i < 0) throw new Error("素材已移除。");
-				const source = l.sources[i];
-				const file = path.join(PHOTOS_DIR, filename);
-				emit({ done: results.length, total: names.length, filename, percent: 0 });
-				const onProgress = (sent, size) => emit({ done: results.length, total: names.length, filename, percent: size ? Math.floor(sent / size * 100) : 100 });
-    const remote = localFolder
-     ? { localPath: await require("./main-lib/folder-transfer.js").copyVerified(file, filename, folder.localPath, controller.signal, onProgress) }
-     : await drive.upload(file, filename, folder.id, controller.signal, onProgress);
-				controller.signal.throwIfAborted();
-				if (options.mode === "move") {
-					await persistMovedSource(source);
-					dropQueuedJobsFor(filename);
-					// Fail visibly if the local copy cannot be deleted; never report a successful move.
-					await fs.promises.unlink(file);
-					if (!removeLibraryRow(filename)) throw new Error("文件已复制，但移除搜索记录失败。");
-					await saveLibrary();
-				}
-				results.push({ filename, ok: true, url: remote.webViewLink || "" });
-			} catch (error) {
-				results.push({ filename, ok: false, error: controller.signal.aborted ? "已取消，素材库副本保留（目标位置可能已有副本）。" : error.message });
-			}
-			emit({ done: results.length, total: names.length, filename, percent: 100 });
-		}
-		return { results, canceled: controller.signal.aborted, folderUrl: folder.webViewLink || "", folderPath: folder.localPath || "" };
-	} finally {
-		driveTransfer = null;
-		for (const win of BrowserWindow.getAllWindows()) win.webContents.send("memories:status", { type: "library-updated" });
-	}
+let fileTaskStore;
+let activeFileTaskID = null;
+function getFileTasks() {
+ if (!fileTaskStore) fileTaskStore = require("./main-lib/file-tasks.js").createFileTasks(path.join(DATA_DIR,"file-tasks.json"), {
+  transfer: runTransferTask, delete: runDeleteTask, cleanup: runCleanupTask,
+ }, job => {
+  if (job.payload.photosDeleteVersion !== 1 && job.payload.rows?.some(row => isPhotosPath(row.source)) && (job.kind === "delete" || (job.kind === "transfer" && job.payload.mode === "move"))) return "旧版照片删除任务需重新选择并确认，已阻止操作图库包内文件";
+  if (isQuitting || startupModelPending || migrationState || driveTransfer) return "等待当前文件任务或模型更新完成";
+  if ((job.kind !== "transfer" || job.payload.mode === "move") && filesLocked()) return FILE_LOCK_ERROR;
+  if (job.kind === "cleanup" && importInFlight && !importControl.paused()) return "等待导入暂停或完成后继续清理";
+  if (job.kind === "transfer" && !job.payload.localFolder && !drive.status().connected) return "等待 Google Drive 重新连接";
+  return "";
+ });
+ return fileTaskStore;
+}
+const {isPhotosPath,photosOriginal,createPhotoDeletion} = require("./main-lib/photo-deletion.js");
+let photoDeletion;
+function getPhotoDeletion() {
+ return photoDeletion ||= createPhotoDeletion({executable:app.isPackaged ? path.join(process.resourcesPath,"apple-photos-bridge") : path.join(__dirname,"main-lib/native/apple-photos-bridge"),directory:path.join(DATA_DIR,"photos-deletion-receipts")});
+}
+const taskSignature = stat => [stat.dev,stat.ino,stat.size,stat.mtimeMs,stat.ctimeMs].join(':');
+async function captureTaskRows(names) {
+ const library = loadLibrary(), rows = [];
+ for (const filename of names) {
+  const i = library.filenames.indexOf(filename);
+  if (i < 0 || path.basename(filename) !== filename) throw Error("选择包含无效素材");
+  const source = library.sources[i];
+  const stat = await fs.promises.stat(path.join(PHOTOS_DIR,filename)).catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
+  const originalStat=source&&path.isAbsolute(source)?await fs.promises.lstat(source).catch(e=>{if(e.code!=="ENOENT")throw e;return null;}):null;
+  rows.push({filename,source,signature:stat?taskSignature(stat):null,originalSignature:originalStat?taskSignature(originalStat):null});
+ }
+ return rows;
+}
+async function assertTaskRow(row, allowMissing = false, photosDeletionConfirmed = false) {
+ const library=loadLibrary(),i=library.filenames.indexOf(row.filename);
+ if(i<0)return false;
+ if(library.sources[i]!==row.source)throw Error("素材来源已经改变，任务未继续");
+ if(assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);
+ if (photosDeletionConfirmed) return true;
+ try{const stat=await fs.promises.stat(path.join(PHOTOS_DIR,row.filename));if(row.signature&&taskSignature(stat)!==row.signature)throw Error("文件已变化，任务未继续");}
+ catch(e){if(!(allowMissing&&e.code==='ENOENT'))throw e;}
+ return true;
+}
+ipcMain.handle("memories:deletion-space-history", () => getFileTasks().spaceHistory());
+ipcMain.handle("memories:file-tasks", () => getFileTasks().snapshot());
+ipcMain.handle("memories:file-task-cancel", (_event,id) => {getFileTasks().cancel(id);if(activeFileTaskID===id)driveTransfer?.abort();return getFileTasks().snapshot();});
+ipcMain.handle("memories:file-task-pause", (_event,id) => {getFileTasks().pause(id);if(activeFileTaskID===id)driveTransfer?.abort();return getFileTasks().snapshot();});
+ipcMain.handle("memories:file-task-resume", (_event,id) => {getFileTasks().resume(id);return getFileTasks().snapshot();});
+ipcMain.handle("memories:drive-pause", () => {if(activeFileTaskID){getFileTasks().pause(activeFileTaskID);driveTransfer?.abort();}return {ok:true};});
+ipcMain.handle("memories:drive-cancel", () => {if(activeFileTaskID)getFileTasks().cancel(activeFileTaskID);driveTransfer?.abort();return {ok:true};});
+ipcMain.handle("memories:drive-transfer", (_event, options) => driveReply(async () => {
+ if(options?.mode==="move"&&filesLocked())throw Error(FILE_LOCK_ERROR);
+ if(driveTransfer)throw Error("正在传输或删除文件，请等待当前操作结束。");
+ if(!Array.isArray(options?.filenames)||!["copy","move"].includes(options?.mode))throw Error("无效的传输请求");
+ const names=[...new Set(options.filenames)];
+ if(!names.length||names.length>10000||names.some(n=>typeof n!=="string"||path.basename(n)!==n))throw Error("选择包含无效素材");
+ if(options.mode==="move"&&names.some(n=>assetLocks.has(n)))throw Error(FILE_LOCK_ERROR);
+ const localFolder=options.destination==="folder";
+ const destination=localFolder&&selectedTransferFolder?.token===options.folderToken?selectedTransferFolder.directory:null;
+ if(localFolder&&!destination)throw Error("请重新选择目标文件夹");
+ if(!localFolder&&!drive.status().connected)throw Error("请先连接 Google Drive");
+ const rows=await captureTaskRows(names);
+ return getFileTasks().add("transfer",{rows,photosDeleteVersion:1,mode:options.mode,localFolder,destination,folderName:String(options.folderName||"SayPhoto 搜索结果").slice(0,160)},rows.length).promise;
 }));
+function photoAssetKey(source) {
+ const match=typeof source==='string' && /^(.*\.photoslibrary)\/originals\/[0-9a-f]\/([0-9a-f-]{36})\.[^/]+$/i.exec(source);
+ return match ? `${match[1]}/${match[2].toUpperCase()}` : null;
+}
+function photoAssetRows(source) {
+ const key=photoAssetKey(source),library=loadLibrary();
+ return key ? library.filenames.flatMap((filename,i)=>photoAssetKey(library.sources[i])===key?[{filename,source:library.sources[i]}]:[]) : [];
+}
+function assertPhotoAssetUnlocked(source) {
+ if(filesLocked() || photoAssetRows(source).some(row=>assetLocks.has(row.filename)))throw Error(FILE_LOCK_ERROR);
+}
+async function forgetPhotoAsset(source) {
+ for(const row of photoAssetRows(source)) {
+  await persistMovedSource(row.source);dropQueuedJobsFor(row.filename);
+  if(!removeLibraryRow(row.filename))throw Error('照片已移到最近删除，但关联搜索记录尚未清理');
+ }
+}
+async function backupPhotoResources(job, row, request, exportResources, signal, save) {
+ const extras=request.resources.filter(item=>item.hash!==request.hash || item.size!==request.size);
+ if(!extras.length)return;
+ const current=job.current;
+ current.stage='copying-photo-resources';save();
+ let directory;
+ if(job.payload.localFolder) {
+  if(!current.resourcesDirectory){current.resourcesDirectory=await fs.promises.mkdtemp(path.join(job.folder.localPath,`${request.uuid}-resources-`));save();}
+  directory=current.resourcesDirectory;
+  const stat=await fs.promises.lstat(directory);
+  if(!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(directory)!==job.folder.localPath)throw Error('配套资源目标已变化，未删除');
+ } else {
+  if(current.resourceStaging && !fs.existsSync(current.resourceStaging))delete current.resourceStaging;
+  if(!current.resourceStaging){current.resourceStaging=await fs.promises.mkdtemp(path.join(app.getPath('temp'),'sayphoto-resource-upload-'));save();}
+  directory=current.resourceStaging;
+  const stat=await fs.promises.lstat(directory);
+  if(!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(directory)!==path.resolve(app.getPath('temp')) || !path.basename(directory).startsWith('sayphoto-resource-upload-'))throw Error('临时上传目录已变化');
+ }
+ try {
+  signal.throwIfAborted();
+  const exported=await exportResources(directory);
+  signal.throwIfAborted();
+  if(exported.files.length!==extras.length)throw Error('配套资源未完整保存，原件保留');
+  current.resourceUploads ||= {};
+  const manifest=[];
+  current.resourceTargetSignatures=[];
+  for(const resource of request.resources) {
+   const extra=exported.files.find(item=>item.index===resource.index);
+   if(!extra){if(resource.hash!==request.hash || resource.size!==request.size)throw Error('缺少配套资源');manifest.push({...resource,file:job.payload.localFolder?`../${row.filename}`:row.filename});continue;}
+   const file=extra.path;
+   if(path.dirname(file)!==directory)throw Error('无效资源路径');
+   const stat=await fs.promises.lstat(file);
+   if(!stat.isFile() || stat.size!==resource.size || await require('./main-lib/folder-transfer.js').digest(file,signal)!==resource.hash)throw Error('配套资源校验失败，原件保留');
+   if(taskSignature(await fs.promises.lstat(file))!==taskSignature(stat))throw Error('配套资源在校验时变化');
+   if(job.payload.localFolder)current.resourceTargetSignatures.push({file,signature:taskSignature(stat)});
+   const name=job.payload.localFolder?path.basename(file):`${request.uuid}-${path.basename(file)}`;
+   if(!job.payload.localFolder){
+    const key=`${resource.index}-${resource.hash}`;current.resourceUploads[key] ||= {};save();
+    await drive.upload(file,name,job.folder.id,signal,()=>{},current.resourceUploads[key],save);
+   }
+   manifest.push({...resource,file:name});
+  }
+  const manifestFile=path.join(directory,'resources.json');
+  const content=JSON.stringify({asset:request.id,resources:manifest},null,2);
+  try{await fs.promises.writeFile(manifestFile,content,{flag:'wx'});}catch(error){if(error.code!=='EEXIST'||await fs.promises.readFile(manifestFile,'utf8')!==content)throw error;}
+  if(!job.payload.localFolder){current.resourceUploads.manifest ||= {};save();await drive.upload(manifestFile,`${request.uuid}-resources.json`,job.folder.id,signal,()=>{},current.resourceUploads.manifest,save);}
+  current.resourcesVerified=true;save();
+ } finally {
+  // OAuth needs a seekable upload file; this task-owned staging folder is never indexed.
+  if(!job.payload.localFolder){await fs.promises.rm(directory,{recursive:true,force:true});delete current.resourceStaging;save();}
+ }
+}
+async function trashTransferredOriginal(job, row, file, signal, save, stopped) {
+ const current = job.current;
+ if (current.originalTrashed) return;
+ if (current.photos?.requested) {
+  const result=await getPhotoDeletion().remove(row.source,row.originalSignature,current,save,signal);
+  current.originalTrashed=true;current.space={trashedCount:result.count,trashedBytes:result.size};current.stage="removing";save();return;
+ }
+ if (!row.source || !path.isAbsolute(row.source) || !row.originalSignature) throw Error("缺少原文件签名，已保留原文件");
+ let before;
+ try { before = await fs.promises.lstat(row.source); }
+ catch (error) { if (error.code === "ENOENT") throw Error("原文件已缺失，无法确认删除结果，未计入统计"); throw error; }
+ if (!before.isFile() || taskSignature(before) !== row.originalSignature) throw Error("原文件已变化，未继续删除");
+ const { digest } = require("./main-lib/folder-transfer.js");
+ const target = job.payload.localFolder ? current.remote?.localPath : file;
+ if (!target) throw Error("目标文件不可用，已保留原文件");
+ const targetBefore = await fs.promises.lstat(target);
+ if ((job.payload.localFolder && !targetBefore.isFile()) || (await fs.promises.stat(target)).size !== before.size) throw Error("目标类型或大小不一致，已保留原文件");
+ const originalHash = await digest(row.source, signal);
+ if (originalHash !== await digest(target, signal)) throw Error("原文件与已校验的目标内容不一致，已保留原文件");
+ if (job.payload.localFolder) {
+  const targetStat = await fs.promises.stat(target);
+  if (targetStat.dev === before.dev && targetStat.ino === before.ino) throw Error("目标与原文件相同，未删除");
+ }
+ const targetAfter = await fs.promises.lstat(target);
+ if (taskSignature(targetAfter) !== taskSignature(targetBefore)) throw Error("校验期间目标文件已变化，已保留原文件");
+ const after = await fs.promises.lstat(row.source);
+ if (taskSignature(after) !== row.originalSignature) throw Error("校验期间原文件已变化，未删除");
+ signal.throwIfAborted();
+ if (stopped()) throw Error("移动已停止，原文件保留");
+ if (filesLocked() || assetLocks.has(row.filename)) throw Error(FILE_LOCK_ERROR);
+ const photos = await photosOriginal(row.source);
+ current.stage = photos ? "photos-deleting" : "trashing-original"; save();
+ let deletedBytes=before.size,deletedCount=1;
+ if (photos) {
+  const result=await getPhotoDeletion().remove(row.source,row.originalSignature,current,save,signal,originalHash,{
+   beforeDelete:async()=>{
+    assertPhotoAssetUnlocked(row.source);signal.throwIfAborted();
+    if(stopped())throw Error("移动已暂停，原件保留");
+    if(taskSignature(await fs.promises.lstat(target))!==taskSignature(targetBefore))throw Error("目标在校验后发生变化，原件保留");
+    for(const item of current.resourceTargetSignatures || [])if(taskSignature(await fs.promises.lstat(item.file))!==item.signature)throw Error("配套资源目标已变化，原件保留");
+    if(!job.payload.localFolder)await drive.upload(file,row.filename,job.folder.id,signal,()=>{},current.upload,save);
+   },
+   backup:(request,exportResources)=>backupPhotoResources(job,row,request,exportResources,signal,save),
+  });
+  deletedBytes=result.size;deletedCount=result.count;
+ }
+ else {
+  if (isPhotosPath(row.source)) throw Error("禁止直接删除Apple图库包内文件");
+  await shell.trashItem(row.source);
+ }
+ current.originalTrashed = true;
+ current.space = { trashedCount: deletedCount, trashedBytes: deletedBytes };
+ current.stage = "removing";
+ job.updatedAt = new Date().toISOString(); save();
+}
+function finishTransferItem(job, filename, save) {
+ if(job.current.photos?.requested && job.current.originalTrashed){job.photosHandled ||= {};job.photosHandled[photoAssetKey(job.payload.rows[job.done].source)]=true;}
+ job.space ||= {};
+ for (const [key, value] of Object.entries(job.current.space || {})) job.space[key] = (job.space[key] || 0) + value;
+ job.updatedAt = new Date().toISOString();
+ job.results.push({filename,ok:true,url:job.current.remote?.webViewLink || ""});
+ job.done++; job.current = null; save();
+}
+async function runTransferTask(job, save, stopped) {
+ const p=job.payload, controller=new AbortController();driveTransfer=controller;activeFileTaskID=job.id;
+ const emit=payload=>{for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:drive-progress",payload);};
+ try{
+  if(!job.folder){job.folder=p.localFolder?{localPath:await fs.promises.mkdtemp(path.join(p.destination,"SayPhoto 搜索结果-"))}:await drive.createFolder(p.folderName,controller.signal);save();}
+  while(job.done<p.rows.length&&!stopped()){
+   const row=p.rows[job.done], filename=row.filename;
+   if(!job.current){job.current={filename,stage:"copying",upload:{}};save();}
+   if (p.repairOriginals) {
+    if(job.photosHandled?.[photoAssetKey(row.source)]){finishTransferItem(job,filename,save);continue;}
+    job.current.remote = {localPath:path.join(job.folder.localPath,filename)};
+    emit({done:job.done,total:job.total,filename,percent:0});
+    await trashTransferredOriginal(job,row,null,controller.signal,save,stopped);
+    if(job.current.photos?.requested && job.current.originalTrashed){await forgetPhotoAsset(row.source);await saveLibrary();}
+    finishTransferItem(job,filename,save);
+    emit({done:job.done,total:job.total,filename,percent:100});
+    continue;
+   }
+   const library=loadLibrary(),index=library.filenames.indexOf(filename);
+   if(index<0&&job.current.stage==="removing") {
+    if(job.current.photos?.requested && job.current.originalTrashed){await forgetPhotoAsset(row.source);await saveLibrary();}
+    finishTransferItem(job,filename,save);continue;
+   }
+   if(index<0 && job.photosHandled?.[photoAssetKey(row.source)]) {finishTransferItem(job,filename,save);continue;}
+   if(index<0)throw Error("素材已移除，无法继续复制");
+   if(library.sources[index]!==row.source)throw Error("素材来源已变化");
+   if(p.mode==="move"&&(filesLocked()||assetLocks.has(filename)))throw Error(FILE_LOCK_ERROR);
+   const file=row.source;
+   if(!file || !path.isAbsolute(file) || !row.originalSignature) throw Error("原文件路径或签名不可用，未执行传输");
+   if (job.current.photos?.requested && !job.current.originalTrashed) await trashTransferredOriginal(job,row,file,controller.signal,save,stopped);
+   let missing=!!job.current.originalTrashed;
+   if (!missing) try{const stat=await fs.promises.lstat(file);if(!stat.isFile() || taskSignature(stat)!==row.originalSignature)throw Error("源文件已改变，未继续传输");}
+   catch(e){if(e.code==='ENOENT'&&job.current.stage==='removing')missing=true;else throw e;}
+   if(!missing){
+    const onProgress=(sent,size)=>emit({done:job.done,total:job.total,filename,percent:size?Math.floor(sent/size*100):100});
+    const remote=p.localFolder?{localPath:await require("./main-lib/folder-transfer.js").copyResumable(file,filename,job.folder.localPath,controller.signal,onProgress,job.id)}:await drive.upload(file,filename,job.folder.id,controller.signal,onProgress,job.current.upload,save);
+    controller.signal.throwIfAborted();if(stopped())break;
+    job.current.remote=remote;job.current.stage="copied";save();
+    if(p.mode==="move"){
+     await trashTransferredOriginal(job,row,file,controller.signal,save,stopped);
+    }
+   }
+   if(p.mode==="move"){
+    if(job.current.originalTrashed){
+     await persistMovedSource(row.source);dropQueuedJobsFor(filename);
+    }
+    if(job.current.photos?.requested && job.current.originalTrashed)await forgetPhotoAsset(row.source);
+    else removeLibraryRow(filename);
+    await saveLibrary();
+   }
+   finishTransferItem(job,filename,save);
+   emit({done:job.done,total:job.total,filename,percent:100});
+  }
+  return {results:job.results,canceled:stopped(),folderUrl:job.folder.webViewLink||"",folderPath:job.folder.localPath||""};
+ }finally{driveTransfer=null;activeFileTaskID=null;for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:status",{type:"library-updated"});}
+}
 
 // App icon (Dock + BrowserWindow). Users pick one of the 1024×1024 PNGs in
 // public/images/app-icons/ via Settings → Appearance. Persisted as
@@ -516,7 +738,129 @@ const readPhotoLocations = require("./main-lib/photo-location.js").createLocatio
  directory: PHOTOS_DIR, cachePath: path.join(DATA_DIR, "photo-locations.json"),
  metadata: file => require("sharp")(file).metadata(),
 });
+const readCaptureDevices = require("./main-lib/capture-device.js").createDeviceIndex({
+ directory: PHOTOS_DIR, cachePath: path.join(DATA_DIR, "capture-devices.json"),
+ metadata: file => require("sharp")(file).metadata(),
+ videoMetadata: async file => {
+  const binary = resolveYtDlpFfmpegLocation(); if (!binary) throw Error("视频元数据读取器不可用");
+  const { stdout } = await require("node:util").promisify(require("node:child_process").execFile)(binary, ["-v", "error", "-i", file, "-f", "ffmetadata", "-"], {timeout: 10000, maxBuffer: 1024 * 1024});
+  return require("./main-lib/capture-device.js").parseVideoMetadata(stdout);
+ },
+});
+ipcMain.handle("memories:capture-devices", async (_event, names, options) => {
+ const cachedOnly = options?.cachedOnly === true;
+ if (!Array.isArray(names) || names.length > (cachedOnly ? 1000 : 20) || names.some(n => typeof n !== "string" || path.basename(n) !== n)) throw Error("Invalid device batch");
+ const known = new Set(loadLibrary().filenames);
+ return readCaptureDevices([...new Set(names)].filter(n => known.has(n)), { cachedOnly });
+});
+const readAiOrigins = require("./main-lib/ai-origin.js").createAiOriginIndex({
+ directory: PHOTOS_DIR, cachePath: path.join(DATA_DIR, "ai-origins.json"),
+ metadata: async file => {
+  if (VIDEO_EXTENSIONS.has(path.extname(file).toLowerCase())) {
+   const binary = resolveYtDlpFfmpegLocation(); if (!binary) throw Error("视频元数据读取器不可用");
+   const { stdout } = await require("node:util").promisify(require("node:child_process").execFile)(binary, ["-v", "error", "-i", file, "-f", "ffmetadata", "-"], { timeout: 10000, maxBuffer: 1024 * 1024 });
+   return stdout;
+  }
+  const data = await require("sharp")(file, { limitInputPixels: false }).metadata();
+  const png = /\.png$/i.test(file) ? await require("./main-lib/ai-origin.js").pngText(file) : "";
+  return [data.xmp, data.exif, data.iptc, png].filter(Boolean).map(value => value.toString()).join("\n");
+ },
+});
+ipcMain.handle("memories:ai-origins", async (_event, names, options) => {
+ const cachedOnly = options?.cachedOnly === true;
+ if (!Array.isArray(names) || names.length > (cachedOnly ? 1000 : 10) || names.some(n => typeof n !== "string" || path.basename(n) !== n || n === "." || n === "..")) throw Error("Invalid AI origin batch");
+ const library = loadLibrary();
+ const positions = new Map(library.filenames.map((name, i) => [name, i]));
+ const items = [...new Set(names)].filter(name => positions.has(name)).map(filename => ({ filename, title: path.basename(library.sources?.[positions.get(filename)] || filename) }));
+ return readAiOrigins(items, { cachedOnly, refresh: options?.refresh === true });
+});
+const readPhotoQuality = require("./main-lib/photo-quality.js").createPhotoQualityIndex({
+ directory: PHOTOS_DIR, cachePath: path.join(DATA_DIR, "photo-quality.json"),
+ binary: app.isPackaged ? path.join(process.resourcesPath, "photo-quality") : path.join(__dirname, "main-lib/native/photo-quality"),
+});
+ipcMain.handle("memories:task-checkpoint", (_event, key, value) => {
+ if (!["quality", "ai-origin"].includes(key)) throw Error("Invalid task key");
+ const file = path.join(DATA_DIR, `task-${key}.json`);
+ if (value === undefined) {
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (error) { if(error.code === "ENOENT") return null; throw error; }
+ }
+ if (!value || typeof value.pending !== "boolean" || !Array.isArray(value.names) || !Array.isArray(value.forced) || [...value.names, ...value.forced].some(n => typeof n !== "string" || !n || path.basename(n)!==n)) throw Error("Invalid task checkpoint");
+ fs.mkdirSync(DATA_DIR, { recursive: true });
+ fs.writeFileSync(file + ".tmp", JSON.stringify(value)); fs.renameSync(file + ".tmp", file);
+ return value;
+});
+ipcMain.handle("memories:photo-quality", async (_event, names, options) => {
+ const cachedOnly = options?.cachedOnly === true;
+ if (!Array.isArray(names) || names.length > (cachedOnly ? 1000 : 16) || names.some(n => typeof n !== "string" || path.basename(n) !== n)) throw Error("Invalid quality batch");
+ const known = new Set(loadLibrary().filenames);
+ return readPhotoQuality([...new Set(names)].filter(n => known.has(n)), { cachedOnly, force: !cachedOnly && options?.force === true });
+});
+const faceThumbnails = require("./main-lib/face-thumbnails.js").createFaceThumbnails({
+ directory: PHOTOS_DIR, root: path.join(DATA_DIR, "people/face-thumbs"), ffmpeg: resolveYtDlpFfmpegLocation,
+});
+const faceGroups = require("./main-lib/face-groups.js").createFaceGroups({
+ directory: PHOTOS_DIR, root: path.join(DATA_DIR, "people"),
+ binary: app.isPackaged ? path.join(process.resourcesPath, "face-groups") : path.join(__dirname, "main-lib/native/face-groups"),
+ getNames: () => loadLibrary().filenames, readThumbnail: faceThumbnails,
+});
+ipcMain.handle("memories:people-status", (_event, revision) => faceGroups.status(typeof revision === "number" ? revision : undefined));
+ipcMain.handle("memories:people-start", () => faceGroups.start());
+ipcMain.handle("memories:people-pause", () => faceGroups.pause());
+ipcMain.handle("memories:people-merge", (_event, ids, targetID) => faceGroups.merge(ids, targetID));
+ipcMain.handle("memories:people-faces", (_event, id, offset) => faceGroups.faces(id, offset));
+ipcMain.handle("memories:people-move-faces", (_event, id, keys) => faceGroups.moveFaces(id, keys));
+ipcMain.handle("memories:people-face-thumbnail", (_event, id, key) => faceGroups.thumbnail(id, key));
+ipcMain.handle("memories:people-rename", (_event, id, name) => {
+ if (typeof id !== "string" || typeof name !== "string") throw Error("Invalid person name");
+ return faceGroups.rename(id, name);
+});
 const loadMapTile = require("./main-lib/map-tiles.js").createTileLoader(path.join(DATA_DIR, "map-tiles"));
+function cleanupStatus() {
+ const task=getFileTasks().snapshot().filter(t=>t.kind==='cleanup').at(-1);
+ return {running:!!task&&['queued','running','waiting'].includes(task.status),done:task?.done||0,total:task?.total||0,converted:task?.summary?.converted||0,bytes:task?.summary?.bytes||0,reasons:task?.summary?.reasons||{},error:task?.error||'',cancelled:task?.status==='cancelled'};
+}
+const copyCleanup={status:cleanupStatus,cancel(){const task=getFileTasks().snapshot().find(t=>t.kind==='cleanup'&&['queued','running','waiting'].includes(t.status));if(task){getFileTasks().cancel(task.id);if(activeFileTaskID===task.id)driveTransfer?.abort();}}};
+async function runCleanupTask(job,save,stopped){
+ const controller=new AbortController();driveTransfer=controller;activeFileTaskID=job.id;
+ try{
+  if(!(await importControl.prepareCleanup()))throw Error('等待当前导入文件处理完成');
+  job.summary ||= {converted:0,bytes:0,reasons:{}};
+  while(job.done<job.payload.rows.length&&!stopped()){
+   const row=job.payload.rows[job.done];
+   if(filesLocked()||assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);
+   const library=loadLibrary(),index=library.filenames.indexOf(row.filename);
+   if(index>=0&&library.sources[index]!==row.source)throw Error('素材来源已经改变，未继续清理');
+   let result={reason:'missing'};
+   if(index>=0)result=await require('./main-lib/copy-cleanup.js').cleanCopy(PHOTOS_DIR,row.filename,row.source,controller.signal);
+   if(result.reason==='converted'){job.summary.converted++;job.summary.bytes+=result.bytes;}
+   else job.summary.reasons[result.reason]=(job.summary.reasons[result.reason]||0)+1;
+   job.done++;save();
+  }
+  return job.summary;
+ }finally{if(driveTransfer===controller)driveTransfer=null;activeFileTaskID=null;}
+}
+ipcMain.handle("memories:copy-cleanup-status", () => copyCleanup.status());
+ipcMain.handle("memories:copy-cleanup-cancel", () => { copyCleanup.cancel(); return copyCleanup.status(); });
+ipcMain.handle("memories:copy-cleanup-start", async () => {
+ if (filesLocked()) return {ok:false,error:FILE_LOCK_ERROR};
+ if (copyCleanup.status().running || driveTransfer || (importInFlight && !importControl.paused()) || migrationState || startupModelPending) return {ok:false,error:"请先暂停导入，并等待模型切换或文件传输完成后再清理。"};
+ const guard = new AbortController();
+ driveTransfer = guard;
+ try {
+  if (!(await importControl.prepareCleanup())) {
+   if (driveTransfer === guard) driveTransfer = null;
+   return {ok:false,error:"导入已暂停，当前文件仍在处理或扫描尚未结束，请稍后重试清理。"};
+  }
+  const choice = await dialog.showMessageBox({type:"warning", buttons:["取消", "校验并删除副本"], defaultId:0, cancelId:0, title:"清理素材副本", message:"校验一致后删除素材库副本，改为引用原文件？", detail:"不会删除原文件或搜索索引。缺失、无权限或内容不同的文件会保留副本。之后移动或删除原文件会影响预览。实际释放空间取决于 APFS 共享数据块。"});
+  if(choice.response !== 1) { driveTransfer = null; return {ok:true,cancelled:true}; }
+  const library = loadLibrary();
+  const rows = library.filenames.map((filename,i) => ({filename,source:library.sources[i]})).filter(row => !assetLocks.has(row.filename));
+  driveTransfer = null;
+  void getFileTasks().add("cleanup",{rows},rows.length).promise.catch(error=>console.warn("[cleanup-recovery]",error.message));
+  return {ok:true};
+ } catch(error) { if(driveTransfer === guard) driveTransfer = null; return {ok:false,error:error.message}; }
+});
+
 ipcMain.handle("memories:file-sizes", async (_event, names) => {
  if (!Array.isArray(names) || names.length > 100 || names.some(name => typeof name !== "string" || path.basename(name) !== name)) throw new Error("Invalid file size batch");
  const known = new Set(loadLibrary().filenames);
@@ -709,6 +1053,8 @@ const NOISE_QUERIES = [
 // model's anisotropy differs, so the CLIP-tuned 0.04 must not be assumed.
 // Returns the thresholds, or null when the library is too small to measure.
 async function calibrateThresholds(modelId) {
+	// The legacy calibration assumes centered CLIP scores near zero.
+	if (getModel(modelId)?.runtime === "embeddinggemma2") return getModel(modelId).thresholds;
 	const l = loadLibrary();
 	// A retired-model library temporarily names its replacement so the worker
 	// can warm it, but its stored rows are still from the old vector space.
@@ -767,6 +1113,7 @@ async function calibrateThresholds(modelId) {
 // backfill cycles. Runs once on startup, before the backfill passes.
 // ---------------------------------------------------------------------------
 async function pruneStaleLibraryEntries() {
+	if (filesLocked()) return;
 	const l = loadLibrary();
 	if (!l || !Array.isArray(l.filenames) || l.filenames.length === 0) return;
 	const total = l.filenames.length;
@@ -780,7 +1127,7 @@ async function pruneStaleLibraryEntries() {
 	for (let i = 0; i < total; i++) {
 		const filename = l.filenames[i];
 		if (!filename) continue;
-		if (!fs.existsSync(path.join(PHOTOS_DIR, filename))) missing++;
+		if (!require("./main-lib/reference-storage.js").entryExists(path.join(PHOTOS_DIR, filename))) missing++;
 	}
 	if (missing === 0) return;
 	const threshold = Math.max(1, Math.ceil(total / 2));
@@ -806,7 +1153,7 @@ async function pruneStaleLibraryEntries() {
 	for (let i = l.filenames.length - 1; i >= 0; i--) {
 		const filename = l.filenames[i];
 		if (!filename) continue;
-		if (fs.existsSync(path.join(PHOTOS_DIR, filename))) continue;
+		if (require("./main-lib/reference-storage.js").entryExists(path.join(PHOTOS_DIR, filename))) continue;
 		// File is gone — remove the entire row (copy, index arrays,
 		// sidecars). removeLibraryRow tolerates a missing copy.
 		if (removeLibraryRow(filename)) removed++;
@@ -1685,7 +2032,7 @@ async function preloadAllModels() {
 // A background delta tail (kind "fill") is the exception: a new switch
 // cancels it (generation bump — its checkpoints stay on disk and the next
 // delta resumes them) and proceeds.
-const { createLiveSearchIndex } = require("./main-lib/live-search-index.js");
+const { createLiveSearchIndex, liveSearchBatch } = require("./main-lib/live-search-index.js");
 let migrationState = null;
 let migrationFillGeneration = 0;
 
@@ -2480,7 +2827,7 @@ function hashFile(file, { stallMs = 30_000 } = {}) {
 	return new Promise((resolve, reject) => {
 		const h = crypto.createHash("sha256");
 		let lastData = Date.now();
-		const s = fs.createReadStream(file);
+		const s = fs.createReadStream(file, { highWaterMark: 1024 * 1024 });
 		const timer = setInterval(() => {
 			if (Date.now() - lastData >= stallMs) {
 				clearInterval(timer);
@@ -2603,6 +2950,9 @@ ipcMain.handle(
 // while a batch is in flight (its rows would embed in the wrong model), and
 // a second batch is refused too (uniqueName dedupe and the ordered flush
 // assume one writer at a time).
+const importControl = require("./main-lib/import-control.js").createImportControl(status => {
+ for (const win of BrowserWindow.getAllWindows()) if (!win.isDestroyed()) win.webContents.send("memories:status", status);
+});
 let importInFlight = false;
 let importSearch = null;
 let importSearchTotal = 0;
@@ -2611,7 +2961,8 @@ let startupModelPending = false;
 // `fromWatch` marks a watched-folder sync (launch / poll / live fs event).
 // The import-failure cache is only consulted for these: a manual re-import is
 // the user explicitly asking for a fresh attempt, so it always runs.
-async function importPaths(rawPaths, { fromWatch = false } = {}) {
+async function importPaths(rawPaths, { fromWatch = false, managedCopy = false } = {}) {
+ if (managedCopy) throw Error("当前仅引用原文件，不再导出或保存素材副本。");
 	if (startupModelPending) return { added: [], skipped: [], errors: [{ file: "", error: "正在准备快速索引模型，请稍后重试。" }], watched: [] };
 	if (driveTransfer) return { added: [], skipped: [], errors: [{ file: "", error: "请等待 Google Drive 上传完成。" }], watched: [] };
 	// A model migration re-embeds the whole library and pins the worker
@@ -2651,18 +3002,21 @@ async function importPaths(rawPaths, { fromWatch = false } = {}) {
 		};
 	}
 	importInFlight = true;
+	importControl.begin();
 	importSearchTotal = loadLibrary().filenames.length;
 	updateTrayState();
 	let result;
 	try {
-		result = await importPathsInner(rawPaths, { fromWatch });
+		result = await importPathsInner(rawPaths, { fromWatch, managedCopy });
 	} catch (error) {
 		for (const win of BrowserWindow.getAllWindows()) {
 			win.webContents.send("memories:status", { type: "import", phase: "done", filename: "" });
 		}
 		throw error;
 	} finally {
+		await flushFailedImports().catch(error => console.warn(`[memories] failed-imports flush: ${error.message}`));
 		importInFlight = false;
+		importControl.finish();
 		importSearch = null;
 		updateTrayState();
 	}
@@ -2681,13 +3035,11 @@ async function importPaths(rawPaths, { fromWatch = false } = {}) {
 	return result;
 }
 
-async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
+async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = false } = {}) {
 	spawnIndexer();
 	// Any path may be a directory (folder picker / folder drop): expand it to
 	// the media files inside so the batch counter below counts real files.
-	for (const win of BrowserWindow.getAllWindows()) {
-		win.webContents.send("memories:status", { type: "import", phase: "scanning", filename: "", done: 0, total: 0 });
-	}
+	importControl.update({ phase: "scanning", filename: "", done: 0, total: 0 });
 	const paths = await expandMediaPaths(rawPaths);
 
 	// Auto-watch folders: any DIRECTORY in the batch joins the persisted
@@ -2749,9 +3101,24 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	// the tail first, so establish source mtime order before dispatching work.
 	// Read metadata asynchronously: cloud-backed folders can take seconds per
 	// stat and must never block the UI or the native file picker.
+	// Already indexed paths need neither a filesystem stat nor an import job.
+	uniquePaths = uniquePaths.filter(file => {
+		if (!importedSources.has(file)) return true;
+		skippedPaths.add(file);
+		return false;
+	});
 	const sourceStats = await require("./indexer/index-performance.js").readStats(
 		uniquePaths, file => fs.promises.stat(file),
 	);
+	if (fromWatch) {
+		// Do not dispatch known failures just to skip them again. Metadata was
+		// read once above; changed sources remain eligible for a fresh attempt.
+		uniquePaths = uniquePaths.filter(file => {
+			if (!isKnownImportFailure(file, sourceStats.get(file) ?? null)) return true;
+			skippedPaths.add(file);
+			return false;
+		});
+	}
 	uniquePaths = sortPathsByMtime(uniquePaths, filePath => sourceStats.get(filePath));
 
 	// Video posters are generated off the import critical path (see below);
@@ -2796,17 +3163,7 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	const CHECKPOINT_INTERVAL = Math.max(25, Math.ceil(total / 20));
 	let sinceCheckpoint = 0;
 	let done = 0;
-	const sendImport = (phase, filename) => {
-		for (const win of BrowserWindow.getAllWindows()) {
-			win.webContents.send("memories:status", {
-				type: "import",
-				phase,
-				filename,
-				done,
-				total,
-			});
-		}
-	};
+	const sendImport = (phase, filename) => importControl.update({ phase, filename, done, total });
 
 	// The batch embeds run CONCURRENTLY across the worker pool; outcomes are
 	// applied in file order so library rows stay 1:1 with filenames.
@@ -2886,11 +3243,16 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 		}
 	};
 
+	const importPacer = require("./main-lib/import-pacer.js").createImportPacer(fromWatch);
+
 	// Process one file: validate, copy, then embed through the worker pool.
 	// Always returns an outcome object (never throws) so the ordered flush
 	// sees a row for every path.
 	const processOne = async (seq) => {
 		const filePath = uniquePaths[seq];
+		// Yield to IPC/I/O on every file; add backpressure only while the
+		// main event loop is delayed, rather than sleeping on every import.
+		await importPacer.wait();
 		let dest = null;
 		try {
 			// A failed model load (broken weights / download failure) must
@@ -2915,7 +3277,7 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			// poison — don't re-copy + re-attempt it on every poll/event. Only
 			// watched-folder syncs consult the cache: a manual re-import is the
 			// user explicitly asking for a fresh attempt.
-			if (fromWatch && (await wasMovedToDrive(filePath) || isKnownImportFailure(filePath))) {
+			if (fromWatch && (await wasMovedToDrive(filePath) || isKnownImportFailure(filePath, sourceStats.get(filePath) ?? null))) {
 				return { kind: "skipped", filePath };
 			}
 			const sourceStat = await fs.promises.stat(filePath);
@@ -2962,7 +3324,8 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			// the main process (and every IPC/status event with it) for the
 			// duration of the copy. The watchdog bounds it: a stalled network
 			// copy must not freeze the pipeline forever (see the helper).
-			await copyFileWithWatchdog(filePath, dest);
+			if (managedCopy) await copyFileWithWatchdog(filePath, dest);
+			else await require("./main-lib/reference-storage.js").createReference(filePath, dest);
 			// Extension normalization: a file whose BYTES disagree with its
 			// extension (WebP saved as .png, JPEG saved as .webp) is renamed
 			// to match its content before anything else references it. This
@@ -3029,7 +3392,7 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			// "File not found" return before the try's risky section, so only
 			// real file-level failures land here; worker-lifecycle errors are
 			// transient and system-wide, and must not poison individual files.
-			if (!isSystemIndexerError(err)) rememberImportFailure(filePath);
+			if (!isSystemIndexerError(err)) rememberImportFailure(filePath, await fs.promises.stat(filePath).catch(() => null));
 			return { kind: "error", filename: path.basename(filePath), dest, err };
 		}
 	};
@@ -3041,13 +3404,16 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 	// (its outcome flushed) — a plain Promise.all over the first wave would
 	// miss tasks launched later by pump().
 	const BATCH_CONCURRENCY = Math.max(2, INDEXER_POOL_SIZE * 2);
+	const concurrency = fromWatch ? 2 : BATCH_CONCURRENCY;
 	const inflight = new Set();
 	let resolveBatch = null;
 	const batchDone = new Promise((r) => {
 		resolveBatch = r;
 	});
 	const pump = () => {
-		while (inflight.size < BATCH_CONCURRENCY && next < total) {
+		// Bound completed-but-unflushed results too: a slow first video
+		// must not accumulate an entire batch behind it.
+		while (!importControl.paused() && inflight.size < concurrency && inflight.size + pendingResults.size < concurrency * 2 && next < total) {
 			const seq = next++;
 			const task = processOne(seq).then(
 				(outcome) => {
@@ -3071,6 +3437,10 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			inflight.add(task);
 			void task.finally(() => {
 				inflight.delete(task);
+                sendImport("embedding", "");
+                if (importControl.paused() && inflight.size === 0) {
+                    void saveLibrary().catch(error => console.warn("[import] pause checkpoint:", error.message));
+                }
 				pump();
 				// Every task's .then (flush) runs before its .finally, so when
 				// this fires with nothing left in flight the batch is complete.
@@ -3078,10 +3448,19 @@ async function importPathsInner(rawPaths, { fromWatch = false } = {}) {
 			});
 		}
 	};
+	importControl.onCleanup(async () => {
+		if (inflight.size > 0) return false;
+		await Promise.all(posterJobs);
+		await saveLibrary();
+		return true;
+	});
+	importControl.onResume(pump);
+	sendImport("embedding", "");
 	pump();
 	// Empty batch: nothing was dispatched, so nothing will ever resolve it.
 	if (total === 0) resolveBatch();
-	await batchDone;
+	try { await batchDone; } finally { importPacer.close(); }
+	importControl.onResume(null);
 
 	for (const p of skippedPaths) {
 		result.skipped.push(path.basename(p));
@@ -4887,16 +5266,18 @@ function enqueueOcr(files, options) {
 	if (!Array.isArray(files)) return;
 	const force = Boolean(options && options.force);
 	const l = loadLibrary();
+	const positions = new Map(l.filenames.map((name, index) => [name, index]));
+	const queued = new Set(ocrQueue);
 	let added = 0;
 	for (const name of files) {
-		const idx = l.filenames.indexOf(name);
+		const idx = positions.get(name);
 		// Unknown row, already queued, or already OCR'd with geometry AND
 		// consistent text (a repeat import must not revisit a healthy row;
 		// text-but-no-geometry rows are re-enqueued deliberately by the
 		// backfill's inconsistency pass). force:true (language change)
 		// bypasses the healthy-row skip — old rows are stale by definition.
-		if (idx === -1) continue;
-		if (ocrQueue.includes(name)) continue;
+		if (idx === undefined) continue;
+		if (queued.has(name)) continue;
 		if (!force) {
 			const words = l.ocrWords ? l.ocrWords[idx] : null;
 			if (words !== null && words.length > 0) continue;
@@ -4910,6 +5291,7 @@ function enqueueOcr(files, options) {
 			}
 		}
 		ocrQueue.push(name);
+		queued.add(name);
 		added++;
 	}
 	if (added > 0) {
@@ -5826,6 +6208,60 @@ function buildApplicationMenu() {
 	Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+const manualImportStateFile = path.join(DATA_DIR, "pending-manual-imports.json");
+let manualImportJobs = [];
+let manualImportPaused = false;
+let manualImportLoaded = false;
+let manualImportDraining = false;
+const manualImportWaiters = new Map();
+function loadManualImports() {
+ if (manualImportLoaded) return;
+ try {
+  const saved = JSON.parse(fs.readFileSync(manualImportStateFile, "utf8"));
+  if (!Array.isArray(saved.jobs)) throw Error("待导入任务记录格式错误");
+  if (saved.jobs.some(job => !job || typeof job.id !== "string" || !Array.isArray(job.paths) || job.paths.some(p => typeof p !== "string" || !path.isAbsolute(p)))) throw Error("待导入任务路径无效");
+  manualImportJobs = saved.jobs;
+  manualImportPaused = saved.paused === true;
+ } catch (error) { if (error.code !== "ENOENT") throw error; }
+ manualImportLoaded = true;
+}
+function saveManualImports() {
+ fs.mkdirSync(DATA_DIR, { recursive: true });
+ fs.writeFileSync(manualImportStateFile + ".tmp", JSON.stringify({ jobs: manualImportJobs, paused: manualImportPaused }));
+ fs.renameSync(manualImportStateFile + ".tmp", manualImportStateFile);
+}
+async function drainManualImports() {
+ if (manualImportDraining || isQuitting) return;
+ loadManualImports();
+ if (manualImportPaused || !manualImportJobs.length) return;
+ manualImportDraining = true;
+ try {
+  while (manualImportJobs.length && !manualImportPaused && !isQuitting) {
+   if (importInFlight || migrationState || startupModelPending || driveTransfer) { await new Promise(resolve => setTimeout(resolve, 1000)); continue; }
+   const job = manualImportJobs[0];
+   try {
+    const result = await importPaths(job.paths);
+    if (isQuitting) return;
+    // The importer persists its failed-file report; successful paths deduplicate on recovery.
+    manualImportJobs.shift(); saveManualImports();
+    manualImportWaiters.get(job.id)?.resolve(result);
+   } catch (error) {
+    if(!isQuitting) manualImportPaused = true; saveManualImports();
+    manualImportWaiters.get(job.id)?.reject(error);
+    console.warn("[import-recovery]", error.message);
+   } finally { manualImportWaiters.delete(job.id); }
+  }
+ } finally { manualImportDraining = false; }
+}
+function enqueueManualImport(paths) {
+ loadManualImports();
+ if (!Array.isArray(paths) || paths.some(p => typeof p !== "string" || !path.isAbsolute(p))) throw Error("无效导入路径");
+ const job = { id: require("node:crypto").randomUUID(), paths };
+ manualImportJobs.push(job); saveManualImports();
+ const result = new Promise((resolve, reject) => manualImportWaiters.set(job.id, { resolve, reject }));
+ void drainManualImports();
+ return result;
+}
 async function pickAndImport() {
 	const win = BrowserWindow.getAllWindows()[0];
 	const result = await dialog.showOpenDialog(win, {
@@ -5865,7 +6301,7 @@ async function pickAndImport() {
 		],
 	});
 	if (result.canceled) return null;
-	return importPaths(result.filePaths);
+	return enqueueManualImport(result.filePaths);
 }
 
 // Renderer sandbox: contextIsolation + sandbox isolate the renderer from
@@ -5911,7 +6347,7 @@ function createWindow({ showOnReady = true } = {}) {
 		show: false,
 		fullscreen: false,
 		fullscreenable: true,
-		title: "big2 photo",
+		title: "SayPhoto",
 		icon: APP_ICON || undefined,
 		webPreferences: WEB_PREFERENCES,
 	});
@@ -6044,8 +6480,19 @@ function ensureRankWorker() {
 	return worker;
 }
 
-function askRankWorker(message) {
+// Keep snapshot uploads and ranking together: overlapping queries must not
+// reset or advance the worker's live cursor between acknowledged batches.
+let rankWorkQueue = Promise.resolve();
+function queueRankWork(work) {
+ const result = rankWorkQueue.then(work);
+ rankWorkQueue = result.catch(() => {});
+ return result;
+}
+
+function askRankWorker(message, expectedWorker) {
+	if (isQuitting) return Promise.reject(new Error("搜索进程已停止，请重试。"));
 	const worker = ensureRankWorker();
+	if (expectedWorker && expectedWorker !== worker) return Promise.reject(new Error("搜索进程已停止，请重试。"));
 	if (message.type === "rank") worker.liveId = null;
 	return new Promise((resolve, reject) => {
 		const id = `k${++rankRequestId}`;
@@ -6056,11 +6503,11 @@ function askRankWorker(message) {
 			reject(err);
 		}, RANK_TIMEOUT_MS);
 		rankPending.set(id, { resolve, reject, timer });
-		worker.process.postMessage({
+		try { worker.process.postMessage({
 			...message,
 			id,
 			gen: libraryGenerationNumber(),
-		});
+		}); } catch (error) { clearTimeout(timer); rankPending.delete(id); reject(error); }
 	});
 }
 
@@ -6138,15 +6585,26 @@ async function rankPartialSearch(queryText, topK) {
  if (!isCurrent()) throw new Error("搜索模型正在切换，请重试。");
  const reply = await askIndexer({ type: "embed-query", text });
  if (!isCurrent() || !reply.vec || reply.vec.length !== live.dim) throw new Error("搜索模型正在切换，请重试。");
- const count = live.rows.length;
- const worker = ensureRankWorker();
- const offset = worker.liveId === live.id ? worker.liveCount : 0;
- const work = askRankWorker({ type: "rank-live", query: queryText, topK, qVec: reply.vec,
-  live: { id: live.id, modelId: live.modelId, dim: live.dim, total: live.total, offset, rows: live.rows.slice(offset, count) } });
- worker.liveId = live.id; worker.liveCount = count;
- let results;
- try { results = await work; }
- catch (error) { worker.liveId = null; throw error; }
+ const {results,count} = await queueRankWork(async () => {
+  if (!isCurrent() || isQuitting) throw new Error("搜索状态已改变，请重试。");
+  const count = live.rows.length;
+  const worker = ensureRankWorker();
+  let offset = worker.liveId === live.id ? worker.liveCount : 0;
+  const update = (at, rows) => ({id:live.id,modelId:live.modelId,dim:live.dim,total:live.total,offset:at,rows});
+  try {
+   while (offset < count) {
+    if (!isCurrent() || isQuitting) throw new Error("搜索状态已改变，请重试。");
+    const rows = liveSearchBatch(live.rows, offset, count);
+    await askRankWorker({type:"sync-live",live:update(offset,rows)},worker);
+    offset += rows.length;
+    worker.liveId = live.id; worker.liveCount = offset;
+   }
+   if (!isCurrent() || isQuitting) throw new Error("搜索状态已改变，请重试。");
+   const results = await askRankWorker({type:"rank-live",query:queryText,topK,qVec:reply.vec,live:update(count,[])},worker);
+   worker.liveId = live.id; worker.liveCount = count;
+   return {results,count};
+  } catch (error) { worker.liveId = null; throw error; }
+ });
  if (!isCurrent()) throw new Error("搜索模型正在切换，请重试。");
  // Do not expose target query vectors to the renderer's old scene index/cache.
  return { results, queryVec: null, partial: true, indexed: count, total: live.total, modelId: live.modelId };
@@ -6180,12 +6638,12 @@ async function rankSearchWithVec(queryText, topK, qVecOverride) {
 	try {
 		// Off-main O(N×dim) scan: structured-clone the query vector into the
 		// rank utilityProcess (embeddings stay put — gen tracks disk reloads).
-		results = await askRankWorker({
+		results = await queueRankWork(() => askRankWorker({
 			type: "rank",
 			query: trimmed,
 			topK: topK || 96,
 			qVec,
-		});
+		}));
 	} catch {
 		// Worker down / timeout / crash — score in-process so search still works.
 		try {
@@ -6440,17 +6898,30 @@ ipcMain.handle("memories:import-paths", async (_event, paths) => {
 	const list = Array.isArray(paths)
 		? paths.filter((p) => typeof p === "string")
 		: [];
-	return importPaths(list);
+	return enqueueManualImport(list);
 });
 
+ipcMain.handle("memories:import-state", () => {
+ loadManualImports();
+ const state = importControl.snapshot();
+ return !state.active && manualImportJobs.length ? { ...state, active: true, paused: manualImportPaused, phase: "waiting", total: manualImportJobs.length, done: 0 } : state;
+});
+ipcMain.handle("memories:import-pause", (_event, paused) => {
+ if (paused === false && driveTransfer) throw new Error("请等待副本清理或文件传输结束后再继续导入。");
+ loadManualImports();
+ manualImportPaused = paused; saveManualImports();
+ const state = importControl.setPaused(paused);
+ if (!paused) void drainManualImports();
+ return state;
+});
 ipcMain.handle("memories:pick", async () => pickAndImport());
 
 let applePhotos;
 function getApplePhotos() {
  if (!applePhotos) applePhotos = require("./main-lib/apple-photos.js").createApplePhotos({
-  directory: DATA_DIR,
+  directory: DATA_DIR, referenceOnly: true,
   executable: app.isPackaged ? path.join(process.resourcesPath, "apple-photos-bridge") : path.join(__dirname, "main-lib/native/apple-photos-bridge"),
-  importFiles: paths => importPaths(paths),
+  importFiles: paths => importPaths(paths, { managedCopy: true }),
   busy: () => isQuitting || startupModelPending || !!migrationState || importInFlight || !!driveTransfer,
  });
  return applePhotos;
@@ -6570,16 +7041,17 @@ function dropQueuedJobsFor(filename) {
 	if (lastOcrFile === filename) lastOcrFile = null;
 }
 
-// Remove one library row: unlinks the app-managed copy in PHOTOS_DIR (plus
+// Remove one library row: unlinks the reference entry in PHOTOS_DIR (plus
 // the video poster/scene-poster/thumbnail sidecars, if any) and splices the
 // parallel index arrays (filename, source, OCR, hash, embedding, phrase).
 // The original imported file on disk is deliberately untouched — only the
-// app's own copy is deleted, matching the renderer's "Delete" menu item.
+// reference entry is removed here; callers handle trashing the original.
 // The filename must be a known library entry (the indexOf guard), so an
 // arbitrary string can never unlink a file of the renderer's choosing.
 // Callers decide when to saveLibrary() + broadcast. Returns true when a row
 // was actually removed.
 function removeLibraryRow(filename) {
+	if (assetLocks.has(filename)) return false;
 	const l = loadLibrary();
 	const idx = l.filenames.indexOf(filename);
 	if (idx === -1) return false;
@@ -6633,7 +7105,9 @@ function removeLibraryRow(filename) {
 	return true;
 }
 
-ipcMain.handle("memories:delete", async (_event, filename, options) => {
+async function performDelete(filename, options, journal, save) {
+	if (assetLocks.has(filename)) return {ok:false,error:FILE_LOCK_ERROR};
+	if (filesLocked()) return {ok:false,error:FILE_LOCK_ERROR};
 	if (driveTransfer) return { ok: false, error: "正在传输或删除文件，请稍后重试。" };
  if (migrationState) return { ok: false, error: "正在切换搜索模型，完成后才能删除素材。" };
  // Imports append complete rows synchronously; deleting an existing row does
@@ -6647,6 +7121,11 @@ ipcMain.handle("memories:delete", async (_event, filename, options) => {
  try {
  // Keep watched-folder sync from adding the unchanged original back.
  const original = library.sources[row];
+ if (options?.duplicateKeeper !== undefined && (!journal?.validated || fs.existsSync(original))) {
+  if (options.original !== true) return {ok:false, error:"重复清理必须删除原文件。"};
+  try { await require("./main-lib/duplicate-cleanup.js").verifyDuplicate({library, filename, keeper:options.duplicateKeeper, isLocked:name=>assetLocks.has(name)}); }
+  catch (error) { return {ok:false, error:error.message}; }
+ }
  if (options?.original === true) {
   if (!original || !path.isAbsolute(original)) return { ok: false, error: "没有记录原文件路径，无法删除原文件。" };
   try {
@@ -6654,24 +7133,51 @@ ipcMain.handle("memories:delete", async (_event, filename, options) => {
    if (!stat.isFile()) return { ok: false, error: "原路径不是普通文件，未执行删除。" };
   } catch (error) { if (error.code !== "ENOENT") return { ok: false, error: "无法读取原文件，未执行删除。" }; }
  }
+ if(journal&&!journal.sizes){
+  const sourceStat=options?.original===true?await fs.promises.lstat(original).catch(e=>{if(e.code!=='ENOENT')throw e;return null;}):null;
+  journal.sizes={original:sourceStat?.isFile()?sourceStat.size:null};save();
+ }
+ if(journal&&!journal.validated){journal.validated=true;save();}
  await persistMovedSource(original);
  let originalTrashed = false;
  if (options?.original === true) {
   try { await fs.promises.lstat(original); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
   try {
-   // trashItem uses the original path stored by the importer, never a renderer-supplied path.
-   await shell.trashItem(original); originalTrashed = true;
+   // Route Photos assets through PhotoKit; ordinary files use the stored importer path.
+   const photos = await photosOriginal(original);
+   if (photos) {
+    if(!journal) throw Error("照片删除缺少持久任务记录");
+    const result=await getPhotoDeletion().remove(original,journal.originalSignature,journal,save,driveTransfer.signal,undefined,{beforeDelete:async request=>{
+     assertPhotoAssetUnlocked(original);
+     if(options.duplicateKeeper){
+      const keeperIndex=library.filenames.indexOf(options.duplicateKeeper);
+      const keeper=keeperIndex>=0?library.sources[keeperIndex]:null;
+      if(!keeper || photoAssetKey(keeper)===photoAssetKey(original))throw Error("不能删除保留原图所属的同一照片项目");
+      if(request.resources.length===1)return;
+      const other=await getPhotoDeletion().inspect(keeper,driveTransfer.signal);
+      const fingerprints=resources=>JSON.stringify(resources.map(r=>`${r.type}:${r.size}:${r.hash}`).sort());
+      if(fingerprints(request.resources)!==fingerprints(other.resources))throw Error("配套资源不同，不能作为重复照片删除；可单独选择原件删除");
+     }
+    }});
+    journal.sizes.original=result.size;journal.deletedResourceCount=result.count;
+   } else {
+    if(isPhotosPath(original))throw Error("禁止直接删除Apple图库包内文件");
+    await shell.trashItem(original);
+   }
+   originalTrashed = true; if(journal){journal.trashed=true;if(journal.sizes.original!==null){journal.space ||= {};journal.space.trashedCount=journal.deletedResourceCount || 1;journal.space.trashedBytes=journal.sizes.original;}save();}
   } catch (error) {
-   // A missing source needs only library cleanup; any other trash failure preserves the library.
+   if (isPhotosPath(original) || journal?.photos) return {ok:false,error:error.message || "Apple照片删除结果未确认，原记录保留"};
+   // A missing ordinary source needs only library cleanup.
    try { await fs.promises.lstat(original); }
    catch (missing) { if (missing.code === "ENOENT") originalTrashed = true; }
    if (!originalTrashed) return { ok: false, error: "无法将原文件移到废纸篓，素材库仍保留。请检查文件权限或网盘状态。" };
   }
  }
  try { await fs.promises.unlink(path.join(PHOTOS_DIR, filename)); }
- catch (error) { if (error.code !== "ENOENT") return { ok: false, error: originalTrashed ? "原文件已移到废纸篓，但素材库副本清理失败，请重试。" : "素材库副本删除失败。" }; }
+ catch (error) { if (error.code !== "ENOENT") return { ok: false, error: originalTrashed ? "原文件已移到废纸篓，但文件引用清理失败，请重试。" : "文件引用移除失败。" }; }
 	if (!removeLibraryRow(filename)) return { ok: false };
+ if(journal?.photos?.requested && originalTrashed)await forgetPhotoAsset(original);
 	await saveLibrary();
 	// Stop the pumps working on the deleted row (queued jobs, tray
 	// progress) and push fresh tray snapshots — otherwise the pills keep
@@ -6685,7 +7191,47 @@ ipcMain.handle("memories:delete", async (_event, filename, options) => {
 	broadcastOcrEvent(ocrSnapshot());
 	return { ok: true };
  } finally { driveTransfer = null; }
-});
+}
+
+async function createDeleteTask(entries) {
+ if(filesLocked())throw Error(FILE_LOCK_ERROR);
+ if(!Array.isArray(entries)||!entries.length||entries.some(e=>typeof e?.filename!=="string"||path.basename(e.filename)!==e.filename))throw Error("无效删除任务");
+ const rows=await captureTaskRows([...new Set(entries.map(e=>e.filename))]);
+ for(const row of rows){if(assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);const request=entries.find(e=>e.filename===row.filename);row.options={original:request.original===true,...(typeof request.duplicateKeeper==='string'?{duplicateKeeper:request.duplicateKeeper}:{})};}
+ return getFileTasks().add("delete",{rows,photosDeleteVersion:1},rows.length).promise;
+}
+ipcMain.handle("memories:delete-batch", (_event,entries)=>driveReply(()=>createDeleteTask(entries)));
+ipcMain.handle("memories:delete", (_event,filename,options)=>driveReply(async()=>{const result=await createDeleteTask([{...options,filename}]);return result.results[0]||{ok:false};}));
+async function runDeleteTask(job,save,stopped){
+ activeFileTaskID=job.id;
+ try{
+  while(job.done<job.payload.rows.length&&!stopped()){
+   const row=job.payload.rows[job.done];
+   if(!job.current){job.current={filename:row.filename,originalSignature:row.originalSignature};save();}
+   if(job.current.photos?.requested){
+    const result=await getPhotoDeletion().remove(row.source,row.originalSignature,job.current,save);
+    job.current.trashed=true;job.current.space={trashedCount:result.count,trashedBytes:result.size};save();
+   }
+   const photosDeletionConfirmed=!!(job.current.photos?.requested && job.current.trashed);
+   const present=await assertTaskRow(row,true,photosDeletionConfirmed);
+   if(!present && photosDeletionConfirmed){await forgetPhotoAsset(row.source);await saveLibrary();}
+   if(present){
+    if(row.options.original&&row.source&&!photosDeletionConfirmed){
+     const stat=await fs.promises.lstat(row.source).catch(e=>{if(e.code!=="ENOENT")throw e;return null;});
+     if(stat&&(!row.originalSignature||taskSignature(stat)!==row.originalSignature))throw Error("原文件已变化，未继续删除");
+    }
+    if(stopped())break;
+    const result=await performDelete(row.filename,row.options,job.current,save);
+    if(!result.ok)throw Error(result.error||"删除未完成");
+   }
+   job.space ||= {};
+   for(const [key,value] of Object.entries(job.current.space||{}))job.space[key]=(job.space[key]||0)+value;
+   job.updatedAt=new Date().toISOString();
+   job.results.push({filename:row.filename,ok:true});job.done++;job.current=null;save();
+  }
+  return {results:job.results,canceled:stopped()};
+ }finally{activeFileTaskID=null;}
+}
 
 // Current AI-engine status, so the renderer can ask on mount instead of
 // hoping it didn't miss the broadcast window.
@@ -7025,7 +7571,7 @@ function trayStatusLines() {
 function buildTrayMenu() {
 	const template = [
 		{
-			label: "打开big2 photo",
+			label: "打开SayPhoto",
 			click: () => showAndFocusMain(),
 		},
 		{
@@ -7054,7 +7600,7 @@ function buildTrayMenu() {
 	}
 	if (statusLines.length > 0) template.push({ type: "separator" });
 	template.push({
-		label: "退出big2 photo",
+		label: "退出SayPhoto",
 		click: () => {
 			isQuitting = true;
 			app.quit();
@@ -7071,7 +7617,7 @@ function createTray() {
 		return;
 	}
 	tray = new Tray(icon);
-	tray.setToolTip("big2 photo");
+	tray.setToolTip("SayPhoto");
 	// Deliberately NO setContextMenu: on macOS an attached menu hijacks
 	// left-click. Left-click toggles the window; right-click pops a menu
 	// built fresh at open time so the status lines are never stale.
@@ -8129,6 +8675,10 @@ ipcMain.handle("memories:purge-background", async () => {
 });
 
 ipcMain.handle("memories:library-reset", async () => {
+	if (filesLocked() || assetLocks.list().length) return {ok:false,error:FILE_LOCK_ERROR};
+	if (driveTransfer) return {ok:false,error:"正在操作文件，请稍后重试。"};
+	driveTransfer = new AbortController();
+	try {
 	// Only import/migration block a wipe (they own the pipeline) — pump
 	// activity, however wedged, is purged first instead of refusing: a
 	// stuck chunk must never veto deleting the library.
@@ -8162,7 +8712,7 @@ ipcMain.handle("memories:library-reset", async () => {
 	const { files } = resetLibraryFiles();
 	// Forget overrides + failure history (memory and disk).
 	clearCategoryOverrides();
-	clearFailedImports();
+	await clearFailedImports();
 	// Rebuild empty in memory and persist the clean index, then tell the
 	// renderer to refetch (grid lands on its empty state). Push idle tray
 	// snapshots too — the queues were just drained, and with no further
@@ -8176,6 +8726,7 @@ ipcMain.handle("memories:library-reset", async () => {
 	broadcastTranscribeEvent(transcribeSnapshot());
 	broadcastOcrEvent(ocrSnapshot());
 	return { ok: true, rows, unwatched, files };
+	} finally { driveTransfer = null; }
 });
 
 // ---------------------------------------------------------------------------
@@ -9592,6 +10143,10 @@ if (!gotTheLock) {
 	}
 	app.whenReady().then(async () => {
         setTimeout(() => { if (!isQuitting) getApplePhotos().start(); }, 15000).unref();
+        setTimeout(() => { if (!isQuitting) { getFileTasks().start();
+          const repairArg = process.argv.find(arg => arg.startsWith("--finish-moved-originals="));
+          if (repairArg) { try { getFileTasks().repairMovedOriginals(repairArg.split("=")[1].split(",")); } catch(error) { console.error("[move-original-repair]",error.message); } }
+          void drainManualImports().catch(error => console.warn("[import-recovery]", error.message)); void faceGroups.resume().catch(error => console.warn("[people-recovery]", error.message)); } }, 18000).unref();
 		detectionStartTimer = setTimeout(() => { try { getDetectionIndex(); } catch (error) { console.warn("[detection-index] startup:", error.message); } }, 3000);
 		detectionStartTimer.unref();
 		loadLibrary();
@@ -9690,7 +10245,7 @@ if (!gotTheLock) {
 				});
 			} catch (error) {
 				console.warn(`[memories] requested model switch deferred: ${error.message}`);
-				if (!isQuitting) dialog.showErrorBox("快速索引模型切换未完成", `${error.message}\n原有索引已保留，下次启动将重试。`);
+				if (!isQuitting) dialog.showErrorBox("搜索模型切换未完成", `${error.message}\n原有索引已保留，下次启动将重试。`);
 			} finally { startupModelPending = false; }
 		}
 		startWatchedFolderWatchers();
@@ -10325,6 +10880,8 @@ if (!gotTheLock) {
 	// A real quit is underway (Cmd+Q, app-menu Quit, tray Quit item): stand
 	// down the close-to-tray handler so the window is allowed to close.
 	app.on("before-quit", () => {
+        isQuitting = true;
+        fileTaskStore?.stop();
 		driveTransfer?.abort();
         applePhotos?.stop();
 		isQuitting = true;
@@ -10362,7 +10919,7 @@ if (!gotTheLock) {
 			runWillQuitCleanup();
 			void (async () => {
 				try {
-					await drainPersistQueue(10000);
+					await Promise.all([drainPersistQueue(10000), flushFailedImports(), faceGroups.shutdown()]);
 				} catch {
 					/* quit with what's flushed */
 				}

@@ -66,3 +66,11 @@ Asset/*
 
 # Local build dependency symlink
 /node_modules
+
+/runtime/embeddinggemma2/node_modules/
+
+/benchmarks/model-ab-100/
+
+/main-lib/native/face-groups
+
+/main-lib/native/photo-quality

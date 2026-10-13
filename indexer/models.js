@@ -39,6 +39,28 @@
 // Entries are listed in picker order: the scene-search default first, then
 // the alternatives. The picker renders them in this order.
 const MODELS = {
+	"embeddinggemma-2": {
+	"repo": "onnx-community/embeddinggemma-2-ONNX",
+	"label": "EmbeddingGemma 2",
+	"description": "本地多模态检索，原生支持中文。首次切换需重建索引；视频沿用抽帧检索。Q4 文字与视觉编码器。",
+	"dim": 768,
+	"inputSize": 768,
+	"runtime": "embeddinggemma2",
+	"nativeMultilingual": true,
+	"license": "Apache-2.0",
+	"speed": "待实测",
+	"quality": "待真实素材验证",
+	"thresholds": {
+		"minSemanticScore": 0.5,
+		"relativeKeep": 0.85
+	},
+	"minimumWeightBytes": {
+		"onnx/model_q4.onnx": 490742,
+		"onnx/model_q4.onnx_data": 174028800,
+		"onnx/vision_encoder_q4.onnx": 159400,
+		"onnx/vision_encoder_q4.onnx_data": 108957696
+	}
+},
 	"clip-vit-l14-336": {
 		repo: "Xenova/clip-vit-large-patch14-336",
 		label: "CLIP ViT-L/14@336",

@@ -3,13 +3,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-function createApplePhotos({ directory, executable, importFiles, busy, platform = process.platform, bridge }) {
+function createApplePhotos({ directory, executable, importFiles, busy, platform = process.platform, bridge, referenceOnly = false }) {
   const stateFile = path.join(directory, 'apple-photos.json');
   let saved = { enabled: false, known: [] };
   try { saved = { ...saved, ...JSON.parse(fs.readFileSync(stateFile, 'utf8')) }; } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const known = new Set(saved.known);
   let timer, child, running = false, stopped = false;
-  let status = { supported: platform === 'darwin', enabled: !!saved.enabled, phase: 'idle', indexed: known.size, total: 0, failed: 0, error: '', limited: false, lastSync: saved.lastSync || null };
+  let status = { supported: platform === 'darwin', referenceOnly, enabled: !referenceOnly && !!saved.enabled, phase: 'idle', indexed: known.size, total: 0, failed: 0, error: '', limited: false, lastSync: saved.lastSync || null };
   function persist() {
     fs.mkdirSync(directory, { recursive: true });
     fs.writeFileSync(stateFile + '.tmp', JSON.stringify({ enabled: status.enabled, known: [...known], lastSync: status.lastSync }));
@@ -76,13 +76,14 @@ function createApplePhotos({ directory, executable, importFiles, busy, platform 
   return {
     snapshot: () => ({ ...status }),
     async connect() {
+      if (referenceOnly) throw new Error("仅引用模式不导出图库副本，请通过添加素材引用可读取的原文件。");
       if (platform !== 'darwin') throw new Error('此功能仅支持 macOS');
       if (running) return { ...status };
       running = true;
       try {
         const permission = await call({ mode: 'authorize' });
         console.log('[apple-photos] authorization:', permission.authorization);
-        if (!permission.ok) throw new Error('请在系统设置 → 隐私与安全性 → 照片中允许big2 photo访问全部照片。');
+        if (!permission.ok) throw new Error('请在系统设置 → 隐私与安全性 → 照片中允许SayPhoto访问全部照片。');
         status.enabled = true; status.error = ""; status.limited = !!permission.limited; persist();
       } catch (error) { status.error = error.message; status.phase = "error"; throw error; }
       finally { running = false; }

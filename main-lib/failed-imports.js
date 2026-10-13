@@ -43,34 +43,92 @@ function loadFailedImports() {
 	} catch {
 		failedImports = {};
 	}
-	// Prune entries whose source no longer exists (the file was deleted or
-	// the folder unwatched) so the cache can't grow without bound.
-	for (const p of Object.keys(failedImports)) {
-		if (!fs.existsSync(p)) delete failedImports[p];
-	}
+	// Validate a cached row only when its source is encountered. A startup
+	// walk of hundreds of thousands of existsSync calls blocks the app and
+	// treats temporarily offline volumes as deleted files.
+
 	return failedImports;
 }
 
 // Fresh-start wipe: forget every remembered failure (memory + disk) so a
 // re-imported file gets a clean evaluation instead of a cached skip.
-function clearFailedImports() {
-	failedImports = {};
-	failedImportsDirty = true;
-	saveFailedImports();
+let saveTimer = null;
+let saving = null;
+const SAVE_DELAY_MS = 5000;
+
+function scheduleFailedImportsSave() {
+	if (saveTimer || saving) return;
+	saveTimer = setTimeout(() => {
+		saveTimer = null;
+		void saveFailedImports().catch(err => {
+			console.warn(`[memories] failed-imports save failed: ${err.message}`);
+		});
+	}, SAVE_DELAY_MS);
+	saveTimer.unref?.();
 }
 
+function markFailedImportsDirty() {
+	failedImportsDirty = true;
+	scheduleFailedImportsSave();
+}
+
+async function clearFailedImports() {
+	failedImports = {};
+	markFailedImportsDirty();
+	await flushFailedImports();
+}
+
+// One coalesced checkpoint, with bounded serialization and asynchronous I/O.
+// Rename only a complete file; a failed write never replaces the last cache.
 function saveFailedImports() {
-	if (!failedImportsDirty) return;
+	if (saving) return saving;
+	clearTimeout(saveTimer);
+	saveTimer = null;
+	if (!failedImportsDirty) return Promise.resolve();
 	failedImportsDirty = false;
-	try {
-		fs.mkdirSync(DATA_DIR, { recursive: true });
-		fs.writeFileSync(
-			failedImportsFile(),
-			JSON.stringify({ version: 1, failed: failedImports }, null, "\t"),
-		);
-	} catch (err) {
-		console.warn(`[memories] failed-imports save failed: ${err.message}`);
-	}
+	const cache = failedImports;
+	const target = failedImportsFile();
+	const temporary = `${target}.tmp-${process.pid}`;
+	saving = (async () => {
+		let handle;
+		try {
+			await fs.promises.mkdir(DATA_DIR, { recursive: true });
+			handle = await fs.promises.open(temporary, "w", 0o600);
+			await handle.writeFile('{"version":1,"failed":{');
+			let chunk = "", first = true, count = 0;
+			for (const name in cache) {
+				if (!Object.hasOwn(cache, name)) continue;
+				chunk += `${first ? "" : ","}${JSON.stringify(name)}:${JSON.stringify(cache[name])}`;
+				first = false;
+				if (++count % 256 === 0) {
+					await handle.writeFile(chunk);
+					chunk = "";
+					await new Promise(resolve => setImmediate(resolve));
+				}
+			}
+			await handle.writeFile(chunk + "}}\n");
+			await handle.sync();
+			await handle.close();
+			handle = null;
+			await fs.promises.rename(temporary, target);
+		} catch (error) {
+			failedImportsDirty = true;
+			throw error;
+		} finally {
+			await handle?.close().catch(() => {});
+			await fs.promises.unlink(temporary).catch(() => {});
+		}
+	})().finally(() => {
+		saving = null;
+		if (failedImportsDirty) scheduleFailedImportsSave();
+	});
+	return saving;
+}
+
+// Called at batch end, reset and orderly quit; include changes that arrived
+// during a checkpoint rather than losing them behind the in-flight promise.
+async function flushFailedImports() {
+	do { await saveFailedImports(); } while (failedImportsDirty);
 }
 
 // System-wide indexer failures (worker crashed, pool gone, model down) are
@@ -88,9 +146,10 @@ function isSystemIndexerError(err) {
 
 // Record a file that failed to import (stamped with its current size/mtime so
 // a later change invalidates the entry and allows a retry).
-function rememberImportFailure(filePath) {
+function rememberImportFailure(filePath, sourceStat) {
 	try {
-		const st = fs.statSync(filePath);
+		const st = arguments.length > 1 ? sourceStat : fs.statSync(filePath);
+		if (!st) throw new Error("Source unavailable");
 		const rec = loadFailedImports()[filePath];
 		loadFailedImports()[filePath] = {
 			// Count consecutive failures of the UNCHANGED file; a changed file
@@ -102,8 +161,7 @@ function rememberImportFailure(filePath) {
 			size: st.size,
 			mtimeMs: st.mtimeMs,
 		};
-		failedImportsDirty = true;
-		saveFailedImports();
+		markFailedImportsDirty();
 	} catch {
 		/* unreadable — nothing to remember */
 	}
@@ -111,11 +169,12 @@ function rememberImportFailure(filePath) {
 
 // True when the file has failed MAX_IMPORT_FAILURES times UNCHANGED — skip it
 // without copying. A changed file clears its entry (the retry may run).
-function isKnownImportFailure(filePath) {
+function isKnownImportFailure(filePath, sourceStat) {
 	const rec = loadFailedImports()[filePath];
 	if (!rec) return false;
 	try {
-		const st = fs.statSync(filePath);
+		const st = arguments.length > 1 ? sourceStat : fs.statSync(filePath);
+		if (!st) throw new Error("Source unavailable");
 		if (st.size === rec.size && st.mtimeMs === rec.mtimeMs) {
 			return (rec.count || 0) >= MAX_IMPORT_FAILURES;
 		}
@@ -123,8 +182,7 @@ function isKnownImportFailure(filePath) {
 		/* file vanished — fall through to clearing */
 	}
 	delete loadFailedImports()[filePath];
-	failedImportsDirty = true;
-	saveFailedImports();
+	markFailedImportsDirty();
 	return false;
 }
 
@@ -134,8 +192,7 @@ function retireImportFailure(filePath) {
 	const cache = loadFailedImports();
 	if (cache && cache[filePath]) {
 		delete cache[filePath];
-		failedImportsDirty = true;
-		saveFailedImports();
+		markFailedImportsDirty();
 	}
 }
 
@@ -145,6 +202,7 @@ module.exports = {
 	MAX_IMPORT_FAILURES,
 	loadFailedImports,
 	saveFailedImports,
+	flushFailedImports,
 	clearFailedImports,
 	isSystemIndexerError,
 	rememberImportFailure,

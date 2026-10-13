@@ -8,8 +8,8 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { isModelWeight, removePackagedModels } from "./package-content.mjs";
 
-const source = resolve(process.argv[2] || ["/Applications/big2 photo.app", "/Applications/飞图.app", "/Applications/SCM 拾光.app", "/Applications/SCM.app"].find(existsSync) || "/Applications/SCM.app");
-const output = resolve(process.argv[3] || join(tmpdir(), `fly-photo-${Date.now()}`, "big2 photo.app"));
+const source = resolve(process.argv[2] || ["/Applications/SayPhoto.app", "/Applications/big2 photo.app", "/Applications/飞图.app", "/Applications/SCM 拾光.app", "/Applications/SCM.app"].find(existsSync) || "/Applications/SCM.app");
+const output = resolve(process.argv[3] || join(tmpdir(), `fly-photo-${Date.now()}`, "SayPhoto.app"));
 if (existsSync(output)) throw new Error(`Output already exists: ${output}`);
 if (!existsSync("dist/index.html")) throw new Error("Run npm run build first.");
 const inputAsar = join(source, "Contents/Resources/app.asar");
@@ -30,15 +30,19 @@ try {
 	cpSync(resolve("scripts/e2e/live-search.js"), join(stage, "scripts/e2e/live-search.js"));
 	cpSync(resolve("main.js"), join(stage, "main.js"));
 	cpSync(resolve("preload.js"), join(stage, "preload.js"));
-	for (const file of ["indexer.js", "index-performance.js"]) cpSync(resolve("indexer", file), join(stage, "indexer", file));
-	for (const file of ["apple-photos.js", "live-search-index.js", "rank-worker.js", "index-startup.js", "library-store.js", "photo-location.js", "map-tiles.js", "folder-transfer.js", "similar-photos.js", "rank-search.js", "qr-search.js", "detection-index.js", "detection-worker.js"]) cpSync(resolve("main-lib", file), join(stage, "main-lib", file));
+	for (const file of ["indexer.js", "index-performance.js", "models.js", "embeddinggemma2.js"]) cpSync(resolve("indexer", file), join(stage, "indexer", file));
+	for (const file of ["photo-deletion.js", "file-tasks.js", "ai-origin.js", "duplicate-cleanup.js", "photo-quality.js", "import-pacer.js", "face-thumbnails.js", "face-groups.js", "capture-device.js", "asset-locks.js", "failed-imports.js", "import-control.js", "copy-cleanup.js", "reference-storage.js", "apple-photos.js", "live-search-index.js", "rank-worker.js", "index-startup.js", "library-store.js", "photo-location.js", "map-tiles.js", "folder-transfer.js", "similar-photos.js", "rank-search.js", "qr-search.js", "detection-index.js", "detection-worker.js"]) cpSync(resolve("main-lib", file), join(stage, "main-lib", file));
 	cpSync(resolve("main-lib/google-drive.js"), join(stage, "main-lib/google-drive.js"));
 	cpSync(resolve("main-lib/search-translation.js"), join(stage, "main-lib/search-translation.js"));
 	cpSync(resolve("main-lib/llm/server.js"), join(stage, "main-lib/llm/server.js"));
 	// Retain original public assets used by the classic UI (fonts, icons, tour).
-	cpSync(resolve("dist"), join(stage, "dist"), { recursive: true, force: true });
+	execFileSync("ditto", ["--norsrc", "--noextattr", resolve("dist"), join(stage, "dist")]);
 	cpSync(resolve("main-lib/native/qr-detector"), join(output, "Contents/Resources/qr-detector"));
 	execFileSync("swiftc", ["-O", "-module-cache-path", join(tmpdir(), "fly-photo-swift-cache"), resolve("native/apple-photos.swift"), "-o", join(output, "Contents/Resources/apple-photos-bridge"), "-framework", "Photos", "-framework", "CryptoKit"]);
+ execFileSync("swiftc", ["-parse-as-library", "-O", "-module-cache-path", join(tmpdir(), "sayphoto-face-swift-cache"), resolve("native/face-groups.swift"), "-o", join(output, "Contents/Resources/face-groups"), "-framework", "MediaIntelligence", "-framework", "AVFoundation", "-framework", "ImageIO"]);
+ execFileSync("swiftc", ["-parse-as-library", "-O", "-module-cache-path", join(tmpdir(), "sayphoto-quality-swift-cache"), resolve("native/photo-quality.swift"), "-o", join(output, "Contents/Resources/photo-quality"), "-framework", "Vision", "-framework", "ImageIO"]);
+ cpSync(resolve("public/brand/SayPhoto.icns"), join(output, "Contents/Resources/SayPhoto.icns"));
+ execFileSync("ditto", ["--norsrc", "--noextattr", resolve("runtime/embeddinggemma2"), join(output, "Contents/Resources/embeddinggemma2")]);
  const archive = join(output, "Contents/Resources/app.asar");
 	// unpack matches absolute filenames; unpackDir matches archive-relative
 	// directories and keeps native modules beside their dependent libraries.
@@ -56,14 +60,15 @@ try {
 from pathlib import Path
 p=Path(sys.argv[1])
 d=plistlib.loads(p.read_bytes())
-d['CFBundleDisplayName']='big2 photo'
-d['NSPhotoLibraryUsageDescription']='big2 photo需要读取您的照片图库，以便自动同步新增照片、建立本地搜索索引。'
+d['CFBundleDisplayName']='SayPhoto'
+d['CFBundleIconFile']='SayPhoto.icns'
+d['NSPhotoLibraryUsageDescription']='SayPhoto 需要访问您的照片图库以建立本地搜索索引，并在您确认后将核对过的照片或视频移入“最近删除”。'
 # Electron resolves the reused helper binaries from CFBundleName. Keep this
 # internal runtime name; display branding uses CFBundleDisplayName/app.setName.
 if 'Resources/app.asar' in d.get('ElectronAsarIntegrity',{}):
  d['ElectronAsarIntegrity']['Resources/app.asar']['hash']=sys.argv[2]
 p.write_bytes(plistlib.dumps(d))
-for locale,name in [('en','big2 photo'),('zh_CN','big2 photo'),('zh_TW','big2 photo'),('zh-Hans','big2 photo'),('zh-Hant','big2 photo')]:
+for locale,name in [('en','SayPhoto'),('zh_CN','SayPhoto'),('zh_TW','SayPhoto'),('zh-Hans','SayPhoto'),('zh-Hant','SayPhoto')]:
  strings=p.parent/'Resources'/(locale+'.lproj')/'InfoPlist.strings'
  strings.parent.mkdir(parents=True,exist_ok=True)
  existing=plistlib.loads(strings.read_bytes()) if strings.exists() and strings.read_bytes().startswith((b'bplist',b'<?xml')) else {}
@@ -74,7 +79,7 @@ for locale,name in [('en','big2 photo'),('zh_CN','big2 photo'),('zh_TW','big2 ph
 	execFileSync("xattr", ["-cr", output]);
 	execFileSync("codesign", ["--force", "--deep", "--sign", "-", output], { stdio: "inherit" });
 	execFileSync("codesign", ["--verify", "--deep", "--strict", output], { stdio: "inherit" });
-	console.log(`Built: ${output}\nbig2 photo uses the existing library. Quit any running SCM/拾光 instance before opening it.`);
+	console.log(`Built: ${output}\nSayPhoto uses the existing library. Quit any running SCM/拾光 instance before opening it.`);
 } finally {
 	rmSync(stage, { recursive: true, force: true });
 }

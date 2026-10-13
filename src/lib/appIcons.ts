@@ -30,7 +30,7 @@ export interface AppIconInfo {
 }
 
 export const APP_ICONS: AppIconInfo[] = [
-	{ id: "scm-vhs", label: "VHS", blurb: "Retro tape", file: "scm-vhs" },
+	{ id: "scm-vhs", label: "SayPhoto", blurb: "Champagne · by Big2", file: "scm-vhs" },
 	{
 		id: "scm-vhs-player",
 		label: "VHS Player",

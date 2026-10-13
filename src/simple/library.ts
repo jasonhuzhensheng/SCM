@@ -1,8 +1,10 @@
+import { isScreenRecording } from "./screenCapture";
 import { getCategory } from "@/lib/categories";
 import { isVideoFile } from "@/lib/media";
 import type { RankedMemory } from "@/lib/memoryRank";
 
 export interface Asset extends RankedMemory {
+ contentHash?: string;
  detectedLabel?: string;
 	title: string;
 	sourcePath: string;
@@ -21,10 +23,10 @@ export function parseLibrary(index: Record<string, unknown>): Asset[] {
 	return list("images").filter((v): v is string => typeof v === "string").map((filename, i) => {
 		const sourcePath = typeof sources[i] === "string" ? sources[i] as string : "";
 		const override = overrides[String(hashes[i])];
-		return { filename, title: sourcePath.split(/[\\/]/).pop() || filename, sourcePath,
+		return { filename, contentHash: typeof hashes[i] === "string" ? hashes[i] as string : undefined, title: sourcePath.split(/[\\/]/).pop() || filename, sourcePath,
 			modifiedAt: typeof dates[i] === "number" ? dates[i] as number : 0, score: 0,
 			ocr: typeof ocr[i] === "string" ? ocr[i] as string : "",
-			category: isVideoFile(filename) ? "Videos" : getCategory({ filename, sourcePath, screenshotHint: hints[i] === true, override: override === "Screenshots" || override === "Projects" ? override : null }) };
+			category: isVideoFile(filename) ? (isScreenRecording(filename, sourcePath) ? "ScreenRecordings" : "Videos") : getCategory({ filename: `${filename} ${sourcePath.replace(/\\/g, "/").split("/").pop() || ""}`, sourcePath, screenshotHint: hints[i] === true, override: override === "Screenshots" || override === "Projects" ? override : null }) };
 	});
 }
 

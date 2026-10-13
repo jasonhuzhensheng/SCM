@@ -325,7 +325,7 @@ export default function AskPanel({ onNotify }: AskPanelProps) {
 			<p className="text-[12px] leading-relaxed text-zinc-500 dark:text-zinc-400">
 				{allDownloaded
 					? "Everything is downloaded — LLMs run fully offline. The model loads only while you use it and stops a few minutes after."
-					: "Downloads land in your big2 photo data folder and never leave your machine. The model is a large file — on a slow connection it keeps its progress if interrupted, so just press Download again."}
+					: "Downloads land in your SayPhoto data folder and never leave your machine. The model is a large file — on a slow connection it keeps its progress if interrupted, so just press Download again."}
 			</p>
 		</div>
 	);

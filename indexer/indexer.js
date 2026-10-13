@@ -241,10 +241,10 @@ function averageVectors(a, b) {
 // The state's text-encoder bundle, shaped for core.embedText: tokenizer +
 // text model + the output key the model emits its embedding under
 // ("text_embeds" for CLIP, "pooler_output" for SigLIP).
-function textPair(s) {
+function textPair(s, query = false) {
 	return {
 		tokenizer: s.tokenizer,
-		textModel: s.textModel,
+		textModel: query && s.queryModel ? s.queryModel : s.textModel,
 		outputKey: s.outputKey,
 	};
 }
@@ -259,6 +259,14 @@ async function ensureModel() {
 
 async function loadModels() {
 	try {
+		if (MODEL_CONFIG.runtime === "embeddinggemma2") {
+			const progress_callback = p => { if (p.status === "progress" && p.total > 0) post({type:"model",phase:"loading",progress:Math.min(99,p.loaded/p.total*100)}); };
+			post({type:"model",phase:"loading",progress:0});
+			discardIncompleteWeights();
+			await ensureCompleteWeights(progress_callback);
+			const result = await require("./embeddinggemma2.js").loadEmbeddingGemma2({repo:MODEL_ID,cacheDir:process.env.TRANSFORMERS_CACHE,progress_callback});
+			return result;
+		}
 		console.log(
 			`[indexer] loading transformers.js (model ${MODEL_CONFIG.label})…`,
 		);
@@ -751,11 +759,11 @@ async function enrichVideo(filePath, fromIndex = 0, opts = {}) {
 async function embedQuery(text) {
 	const s = await ensureModel();
 	if (!s.tokenizer || !s.textModel) return null;
-	const templates = buildQueryTemplates(text);
+	const templates = MODEL_CONFIG.runtime === "embeddinggemma2" ? [text.trim()] : buildQueryTemplates(text);
 	const vecs = [];
 	for (const t of templates) {
 		vecs.push(
-			await core.embedText(t, textPair(s), s.dim, MODEL_CONFIG.textMaxLength),
+			await core.embedText(t, textPair(s, true), s.dim, MODEL_CONFIG.textMaxLength),
 		);
 	}
 	const avg = averageEmbeddings(vecs.map((v) => new Float32Array(v)));
@@ -969,7 +977,7 @@ if (process.parentPort) {
 
 // Standalone self-test: `node indexer/indexer.js --smoke`
 async function runSmoke() {
-	const sharp = (await import("sharp")).default;
+	const sharp = MODEL_CONFIG.runtime === "embeddinggemma2" ? (await ensureModel()).sharp : (await import("sharp")).default;
 	const tmp = require("fs").mkdtempSync(
 		require("os").tmpdir() + "/memories-smoke-",
 	);

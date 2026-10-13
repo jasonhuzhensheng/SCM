@@ -46,4 +46,22 @@ function createLiveSearchCache() {
   clear() { current = null; },
  };
 }
-module.exports = { createLiveSearchIndex, createLiveSearchCache };
+// Copy only each view's bytes: structured clone otherwise includes its entire
+// backing bin. Bound each message before Electron's native serializer runs.
+function liveSearchBatch(rows, offset, end) {
+ const batch = [];
+ let bytes = 0;
+ const limit = 1024 * 1024;
+ for (let i = offset; i < end && batch.length < 128; i++) {
+  const row = rows[i];
+  const words = row.ocrWords || [];
+  if (!Array.isArray(words) || words.some(word => typeof word !== 'string')) throw Error('Invalid live search OCR');
+  const size = 256 + Buffer.byteLength(row.filename) + words.reduce((n, word) => n + 16 + Buffer.byteLength(word), 0) + 4 * (row.embedding.length + (row.phrase?.length || 0));
+  if (size > limit) throw Error('单项搜索数据过大，未发送；请等待索引完成后搜索。');
+  if (bytes + size > limit) break;
+  batch.push({filename:row.filename,embedding:Float32Array.from(row.embedding),phrase:row.phrase ? Float32Array.from(row.phrase) : null,ocrWords:words});
+  bytes += size;
+ }
+ return batch;
+}
+module.exports = { createLiveSearchIndex, createLiveSearchCache, liveSearchBatch };

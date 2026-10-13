@@ -36,4 +36,23 @@ async function copyVerified(source, filename, directory, signal, progress) {
   throw error;
  }
 }
-module.exports = { copyVerified };
+async function copyResumable(source, filename, directory, signal, progress, taskID) {
+ const target = path.join(directory, filename);
+ try {
+  const existing = await fs.promises.lstat(target);
+  if (!existing.isFile() || existing.isSymbolicLink()) throw Error('目标文件类型已改变，已保留源文件');
+  const before = await fs.promises.stat(source);
+  if (existing.size !== before.size || await digest(target,signal) !== await digest(source,signal)) throw Error('目标文件已存在且内容不同，未覆盖');
+  const after = await fs.promises.stat(source);
+  if (before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ino !== after.ino) throw Error('源文件已改变');
+  return target;
+ } catch (e) { if(e.code !== 'ENOENT') throw e; }
+ const partial = '.sayphoto-' + taskID + '-' + crypto.createHash('sha256').update(filename).digest('hex') + '.partial';
+ await fs.promises.unlink(path.join(directory,partial)).catch(e=>{if(e.code!=='ENOENT')throw e;});
+ await copyVerified(source, partial, directory, signal, progress);
+ // Link is exclusive; a user-created destination is never overwritten.
+ await fs.promises.link(path.join(directory,partial),target);
+ await fs.promises.unlink(path.join(directory,partial));
+ return target;
+}
+module.exports = { copyVerified, copyResumable, digest };
