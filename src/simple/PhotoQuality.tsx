@@ -77,8 +77,11 @@ export function usePhotoQuality(assets: Asset[], enabled: boolean) {
 		})();
 		return () => { cancelled = true; };
 	}, [names, enabled, paused, retry, checkpointReady]);
-	const done = names.filter(n => records[n]).length;
-	const failed = names.filter(n => records[n] && qualityScore(records[n]) === null).length;
+	const { done, failed } = useMemo(() => {
+		let done = 0, failed = 0;
+		for (const name of names) if (records[name]) { done++; if (qualityScore(records[name]) === null) failed++; }
+		return { done, failed };
+	}, [names, records]);
 	return { records, rankingRecords, restoring, paused, setPaused, error, done, failed, total: names.length, rescore: () => { recoveredNames.current = null; forceTargets.current = new Set(names); setPaused(false); setRetry(v => v + 1); }, retry: () => { recoveredNames.current = null; forceTargets.current = new Set(); recordsRef.current = {}; setPaused(false); setRetry(v => v + 1); } };
 }
 

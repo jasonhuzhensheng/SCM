@@ -44,7 +44,8 @@ export function useCaptureDevices(assets: Asset[], enabled: boolean) {
   if(d?.status==='unknown' && /^DJI[_-]/i.test(a.title))d={brand:'疑似大疆（文件名）',model:'型号未知',status:'suspected'};
   return [a.filename,d||{brand:'待扫描',model:'',status:'pending'}];
  })),[assets,records]);
- return {devices,paused,setPaused,error,retry:()=>{setError('');setRecords({});setRetry(v=>v+1);},done:names.filter(n=>records[n]).length};
+ const done=useMemo(()=>names.reduce((n,name)=>n+(records[name]?1:0),0),[names,records]);
+ return {devices,paused,setPaused,error,retry:()=>{setError('');setRecords({});setRetry(v=>v+1);},done};
 }
 export function CaptureDevicePanel({devices,brand,model,onChange,paused,onPause,done,total,error,onRetry}:{devices:Map<string,CaptureDevice>;brand:string;model:string;onChange:(brand:string,model:string)=>void;paused:boolean;onPause:()=>void;done:number;total:number;error:string;onRetry:()=>void}) {
  const brands=new Map<string,number>(),models=new Map<string,number>();

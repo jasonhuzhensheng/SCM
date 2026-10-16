@@ -16,9 +16,9 @@ function createImportControl(publish = () => {}) {
  };
  return {
   snapshot,
-  begin() { resume = null; prepareCleanup = null; return update({ active: true, paused: false, phase: 'scanning', filename: '', done: 0, total: 0 }); },
+  begin() { resume = null; prepareCleanup = null; return update({ waitingReason: "", active: true, paused: false, phase: 'scanning', filename: '', done: 0, total: 0 }); },
   update,
-  finish() { resume = null; prepareCleanup = null; return update({ active: false, paused: false, phase: 'done', filename: '' }); },
+  finish() { resume = null; prepareCleanup = null; return update({ waitingReason: "", active: false, paused: false, phase: 'done', filename: '' }); },
   paused: () => state.paused,
   onCleanup(callback) { prepareCleanup = callback; },
   async prepareCleanup() {

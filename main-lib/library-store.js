@@ -161,6 +161,7 @@ function readLibraryBins(modelId, count, dim) {
 
 function loadLibrary() {
 	if (library) return library;
+ require("./index-checkpoint").recoverIndexCheckpoint(DATA_DIR);
 	fs.mkdirSync(PHOTOS_DIR, { recursive: true });
 	library = {
 		filenames: [],
@@ -402,20 +403,18 @@ function decodeBinRows(buf, dim) {
 }
 
 function encodeBin(vectors, dim) {
-	// Defensive: never write nulls (an empty vector keeps 1:1 alignment).
-	const body = Buffer.concat(
-		vectors.map((v) =>
-			Buffer.from(
-				v
-					? v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength)
-					: new ArrayBuffer(dim * 4),
-			),
-		),
-	);
-	const header = Buffer.alloc(8);
-	header.writeInt32LE(vectors.length, 0);
-	header.writeInt32LE(dim, 4);
-	return Buffer.concat([header, body]);
+	// One snapshot allocation: copying each vector and concatenating twice
+	// briefly kept three full bins alive (several GB for a large library).
+	const size = vectors.reduce((total, vector) => total + (vector ? vector.byteLength : dim * 4), 8);
+	const result = Buffer.alloc(size);
+	result.writeInt32LE(vectors.length, 0);
+	result.writeInt32LE(dim, 4);
+	let offset = 8;
+	for (const vector of vectors) {
+		if (vector) Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength).copy(result, offset);
+		offset += vector ? vector.byteLength : dim * 4;
+	}
+	return result;
 }
 
 function libraryIndex() {
@@ -611,7 +610,7 @@ function writeBins(modelId, embeddings, phrases, dim, phraseDim, opts = {}) {
 		});
 }
 
-async function saveLibrary() {
+async function saveLibrary({ strict = false } = {}) {
 	const l = loadLibrary();
 	// A retired/unknown model's rows are deliberately withheld while main
 	// builds a replacement index. Startup maintenance (timestamps, stale-row
@@ -619,10 +618,13 @@ async function saveLibrary() {
 	// begins; letting one of those writes through would replace the only
 	// recoverable old index with an empty target-model bin. The migration
 	// clears this guard immediately before its final atomic save.
-	if (l.pendingModelMigration) return;
+	if (l.pendingModelMigration) { if(strict)throw Error("索引迁移未完成，检查点未保存"); return; }
 	fs.mkdirSync(DATA_DIR, { recursive: true });
 	const indexJson = JSON.stringify(libraryIndex());
 	const phraseDim = l.phrases.length === l.filenames.length ? l.dim : 0;
+	// Release old encoded responses before allocating the new save snapshot.
+	libraryBinCache = { key: null, embeddings: null, phrases: null };
+	libraryNormCache = { key: null, norms: null };
 	const embBuf = encodeBin(l.embeddings, l.dim);
 	const phrBuf = encodeBin(l.phrases, phraseDim);
 	// Row-identity snapshot for the delta-switch planner, captured at the
@@ -645,6 +647,17 @@ async function saveLibrary() {
 	libraryNormCache = { key: null, norms: null };
 	try {
 		await enqueuePersist(async () => {
+   require("./index-checkpoint").recoverIndexCheckpoint(DATA_DIR);
+   if(strict){
+    await require("./index-checkpoint").writeIndexCheckpoint(DATA_DIR,[
+     [path.basename(embedFileFor(l.modelId)),embBuf],
+     [path.basename(phraseFileFor(l.modelId)),phrBuf],
+     [path.basename(embedMetaFileFor(l.modelId)),metaJson],
+     [path.basename(INDEX_FILE),indexJson],
+    ]);
+    libraryGeneration++;
+    return;
+   }
 			// Bins first, index last: a crash between renames leaves either
 			// the old index (consistent with the old bins) or a new index
 			// whose bins already landed — never a new index pointing at
@@ -664,6 +677,7 @@ async function saveLibrary() {
 		// in-memory library (what the renderer reads) is still consistent,
 		// and the next save retries the disk write.
 		console.warn(`[memories] library save failed: ${err.message}`);
+  if(strict)throw err;
 	}
 }
 
@@ -1298,6 +1312,7 @@ function cosine(a, b) {
 }
 
 module.exports = {
+	loadedResourceSummary: () => ({ count: library?.filenames?.length ?? null, dimension: library?.dim || 768 }),
 	initLibraryStore,
 	resetLibraryCaches,
 	libraryGenerationNumber,

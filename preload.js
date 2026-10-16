@@ -3,7 +3,10 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("memories", {
-	getAssetLocks: () => ipcRenderer.invoke("memories:get-asset-locks"),
+	burstList: () => ipcRenderer.invoke("memories:burst-list"),
+	getDeleteConcurrency: () => ipcRenderer.invoke("memories:delete-concurrency"),
+ setDeleteConcurrency: value => ipcRenderer.invoke("memories:set-delete-concurrency",value),
+ getAssetLocks: () => ipcRenderer.invoke("memories:get-asset-locks"),
 	setAssetLocks: (names, locked) => ipcRenderer.invoke("memories:set-asset-locks", names, locked),
 	getFileLock: () => ipcRenderer.invoke("memories:get-file-lock"),
 	setFileLock: locked => ipcRenderer.invoke("memories:set-file-lock", locked),
@@ -24,10 +27,12 @@ contextBridge.exposeInMainWorld("memories", {
  peopleRename: (id, name) => ipcRenderer.invoke("memories:people-rename", id, name),
  deletionSpaceHistory: () => ipcRenderer.invoke("memories:deletion-space-history"),
  fileTasks: () => ipcRenderer.invoke("memories:file-tasks"),
+ revealFileTask: id => ipcRenderer.invoke("memories:file-task-reveal", id),
  pauseFileTask: id => ipcRenderer.invoke("memories:file-task-pause", id),
  resumeFileTask: id => ipcRenderer.invoke("memories:file-task-resume", id),
  drivePause: () => ipcRenderer.invoke("memories:drive-pause"),
  cancelFileTask: id => ipcRenderer.invoke("memories:file-task-cancel", id),
+ restoreLockedPhotos: (names, checkOnly = false) => ipcRenderer.invoke("memories:restore-locked-photos", names, checkOnly),
  deleteBatch: entries => ipcRenderer.invoke("memories:delete-batch", entries),
  taskCheckpoint: (key, value) => ipcRenderer.invoke("memories:task-checkpoint", key, value),
  photoQuality: (names, options) => ipcRenderer.invoke("memories:photo-quality", names, options),
@@ -39,7 +44,7 @@ contextBridge.exposeInMainWorld("memories", {
 	driveConfigure: () => ipcRenderer.invoke("memories:drive-configure"),
 	driveLogin: () => ipcRenderer.invoke("memories:drive-login"),
 	driveDisconnect: () => ipcRenderer.invoke("memories:drive-disconnect"),
-	driveTransfer: (options) => ipcRenderer.invoke("memories:drive-transfer", options),
+	driveTransfer: (options) => ipcRenderer.invoke("memories:drive-transfer", { ...options, searchQuery: options.searchQuery ?? document.querySelector('input[aria-label="搜索素材"]')?.value ?? "" }),
 	driveCancel: () => ipcRenderer.invoke("memories:drive-cancel"),
 	onDriveProgress: (callback) => { const listener = (_event, data) => callback(data); ipcRenderer.on("memories:drive-progress", listener); return () => ipcRenderer.removeListener("memories:drive-progress", listener); },
 	translateSearch: (text) => ipcRenderer.invoke("memories:translate-search", text),
@@ -51,8 +56,15 @@ contextBridge.exposeInMainWorld("memories", {
 	rankDialogue: (query, topK) =>
 		ipcRenderer.invoke("memories:rank-dialogue", query, topK),
 	getTranscribeState: () => ipcRenderer.invoke("memories:transcribe-state"),
+	queueImport: (paths) => ipcRenderer.invoke("memories:queue-import", paths),
 	importPaths: (paths) => ipcRenderer.invoke("memories:import-paths", paths),
 	getImportState: () => ipcRenderer.invoke("memories:import-state"),
+ getResourceStatus: () => ipcRenderer.invoke("memories:resource-status"),
+ setResourceMode: mode => ipcRenderer.invoke("memories:resource-mode", mode),
+ acknowledgeResourceSetup: () => ipcRenderer.invoke("memories:resource-acknowledge"),
+ chooseStorageTarget: () => ipcRenderer.invoke("memories:storage-target"),
+ getImportPerformance: () => ipcRenderer.invoke("memories:import-performance"),
+ setImportProcesses: value => ipcRenderer.invoke("memories:set-import-processes", value),
  setImportPaused: paused => ipcRenderer.invoke("memories:import-pause", paused),
 	pickPhotos: () => ipcRenderer.invoke("memories:pick"),
  applePhotosStatus: () => ipcRenderer.invoke("memories:apple-photos-status"),
@@ -160,4 +172,11 @@ contextBridge.exposeInMainWorld("memories", {
 		ipcRenderer.on("memories:status", listener);
 		return () => ipcRenderer.removeListener("memories:status", listener);
 	},
+});
+
+// Observe only whether the settings dialog is open; no DOM text leaves the app.
+window.addEventListener('DOMContentLoaded',()=>{
+ let open=false,scheduled=false;
+ const check=()=>{scheduled=false;const next=document.getElementById('settings-title')?.textContent==='设置';if(next&&!open)ipcRenderer.send('memories:usage-settings');open=next;};
+ new MutationObserver(()=>{if(!scheduled){scheduled=true;setTimeout(check,250)}}).observe(document.body,{childList:true,subtree:true});check();
 });

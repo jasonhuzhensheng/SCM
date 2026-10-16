@@ -2,7 +2,7 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const vm = require("node:vm");
-const { createLiveSearchIndex, createLiveSearchCache } = require("../main-lib/live-search-index");
+const { createLiveSearchIndex, createLiveSearchCache, liveSearchBatch } = require("../main-lib/live-search-index");
 const { scoreLibrary } = require("../main-lib/rank-search");
 
 async function main() {
@@ -32,15 +32,17 @@ async function main() {
   },
  });
  const sent = [], worker = {};
+ let transferred = 0;
  let model = "fast";
  const ctx = {
-  console, createLiveSearchIndex, migrationState: { search: live }, importInFlight: false, importSearch: null,
+  console, createLiveSearchIndex, liveSearchBatch, queueRankWork: work => work(), isQuitting: false, migrationState: { search: live }, importInFlight: false, importSearch: null,
   loadLibrary: () => ({ modelId: "old", filenames: ["pending-passport.jpg"] }),
   poolModelId: () => model, translateSearchQuery: async () => "passport",
   askIndexer: async () => ({ vec: [1, 0] }), ensureRankWorker: () => worker,
   attachQueryVec: (rows, queryVec) => Object.assign(rows, {queryVec}),
   askRankWorker: async msg => {
-   sent.push(msg.live.rows.length);
+   transferred += msg.live.rows.length;
+   if (msg.type === "rank-live") { sent.push(transferred); transferred = 0; }
    handle({ data: structuredClone({ ...msg, id: "test" }) });
    if (!response.ok) throw Error(response.error);
    return response.results;

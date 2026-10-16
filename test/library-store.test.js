@@ -70,6 +70,12 @@ const MODEL = "test-model";
 	const buf = store.encodeBin([new Float32Array([1, 2, 3])], 3);
 	const header = new Int32Array(buf.buffer, buf.byteOffset, 2);
 	assert.deepEqual([...header], [1, 3]);
+	// Non-zero byte offsets, missing rows and independent snapshot ownership.
+	const backing = new Float32Array([99, 4, 5, 88]);
+	const encoded = store.encodeBin([backing.subarray(1, 3), null], 2);
+	backing[1] = 123;
+	assert.equal(encoded.length, 24);
+	assert.deepEqual([...new Float32Array(encoded.buffer, encoded.byteOffset + 8, 4)], [4, 5, 0, 0]);
 
 	// fileMtimeMs never throws (missing file -> null-ish).
 	assert.doesNotThrow(() => store.fileMtimeMs(path.join(dir, "nope.jpg")));

@@ -50,13 +50,14 @@
 		"smoke:perf": "bash -c 'TMP=$(mktemp -d /tmp/scm-perf-XXXX) && ln -s \"$HOME/Library/Application Support/scm/models\" \"$TMP/models\" && mkdir -p \"$TMP/ocr-data\" && for f in \"$HOME/Library/Application Support/scm/ocr-data\"/*.traineddata; do [ -e \"$f\" ] || continue; ln -s \"$f\" \"$TMP/ocr-data/\"; done; MEMORIES_DATA_DIR=$TMP ELECTRON_SMOKE=1 ELECTRON_SMOKE_PERF=1 electron .'",
 		"smoke:grid": "bun run build && bash -c 'TMP=$(mktemp -d /tmp/scm-grid-XXXX) && ln -s \"$HOME/Library/Application Support/scm/models\" \"$TMP/models\" 2>/dev/null || true; mkdir -p \"$TMP/ocr-data\"; for f in \"$HOME/Library/Application Support/scm/ocr-data\"/*.traineddata; do [ -e \"$f\" ] || continue; ln -s \"$f\" \"$TMP/ocr-data/\"; done; MEMORIES_DATA_DIR=$TMP node scripts/perf-grid-fixture.js && MEMORIES_DATA_DIR=$TMP ELECTRON_SMOKE=1 ELECTRON_SMOKE_GRID=1 electron .'",
 		"smoke:ui-review": "bun run build && bash -c 'TMP=$(mktemp -d /tmp/scm-ui-XXXX) && ln -s \"$HOME/Library/Application Support/scm/models\" \"$TMP/models\" 2>/dev/null || true; MEMORIES_DATA_DIR=$TMP ELECTRON_SMOKE_UI_REVIEW=1 electron .'",
-		"dist": "bun run build && electron-builder --mac",
-		"dist:unsigned": "bun run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
+		"dist": "node scripts/release-version.cjs --project && bun run build && bun run build:photos-recovery && electron-builder --mac",
+		"dist:unsigned": "node scripts/release-version.cjs --project && bun run build && bun run build:photos-recovery && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac",
 		"test:decode-ahead": "node test/decode-ahead.test.js",
 		"test:raw-frame-parity": "node test/raw-frame-parity.test.js",
 		"build:qr": "swiftc -O main-lib/native/qr-detector.swift -o main-lib/native/qr-detector",
 		"build:photo-quality": "swiftc -parse-as-library -O -module-cache-path /tmp/sayphoto-quality-swift-cache native/photo-quality.swift -o main-lib/native/photo-quality -framework Vision -framework ImageIO",
 		"build:face-groups": "swiftc -parse-as-library -O -module-cache-path /tmp/sayphoto-face-swift-cache native/face-groups.swift -o main-lib/native/face-groups -framework MediaIntelligence -framework AVFoundation -framework ImageIO",
+		"build:photos-recovery": "clang -fobjc-arc -O2 -framework Foundation -framework Photos native/restore-locked-photos.m -o main-lib/native/restore-locked-photos",
 		"build:photos-bridge": "swiftc -O -module-cache-path /tmp/fly-photo-swift-cache native/apple-photos.swift -o main-lib/native/apple-photos-bridge -framework Photos -framework CryptoKit",
 		"install:embeddinggemma2": "npm ci --prefix runtime/embeddinggemma2 --no-audit --no-fund"
 	},
@@ -123,6 +124,10 @@
 			{
 				"from": "main-lib/native/qr-detector",
 				"to": "qr-detector"
+			},
+			{
+				"from": "main-lib/native/restore-locked-photos",
+				"to": "restore-locked-photos"
 			},
 			{
 				"from": "main-lib/native/apple-photos-bridge",

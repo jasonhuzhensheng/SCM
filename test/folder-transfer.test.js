@@ -9,7 +9,7 @@ const { copyVerified } = require('../main-lib/folder-transfer');
   const source = path.join(root, 'source'); const out = path.join(root, 'out'); await fs.mkdir(out);
   await fs.writeFile(source, Buffer.alloc(200000, 7));
   const control = new AbortController(); let progress = 0;
-  const target = await copyVerified(source, 'photo.jpg', out, control.signal, sent => progress = sent);
+  const target = await copyVerified(source, 'photo.jpg', out, control.signal, (sent, size, phase) => { if (phase === "copying") progress = sent; });
   assert.deepEqual(await fs.readFile(target), await fs.readFile(source)); assert.equal(progress, 200000);
   await assert.rejects(copyVerified(source, 'photo.jpg', out, control.signal, () => {}), { code: 'EEXIST' });
   assert.equal((await fs.stat(target)).size, 200000);

@@ -1,0 +1,12 @@
+const assert = require('node:assert/strict');
+const {liveSearchBatch,createLiveSearchCache}=require('../main-lib/live-search-index');
+const row={filename:'photo.jpg',embedding:new Float32Array([1,0]),phrase:null,ocrWords:[{text:'海边',bbox:{x0:1,y0:2}},'beach']};
+const batch=liveSearchBatch([row],0,1);
+assert.deepEqual(batch[0].ocrWords,[{text:'海边'},{text:'beach'}]);
+assert.equal(row.ocrWords[0].bbox.x0,1);
+const cache=createLiveSearchCache().apply({id:'test',modelId:'clip',dim:2,total:1,offset:0,rows:structuredClone(batch)});
+assert.deepEqual(cache.library.ocrWords[0],batch[0].ocrWords);
+assert.throws(()=>liveSearchBatch([{...row,ocrWords:[{text:3}]}],0,1),/Invalid/);
+assert.throws(()=>liveSearchBatch([{...row,ocrWords:[{text:'x'.repeat(1048576)}]}],0,1),/过大/);
+assert.equal(liveSearchBatch(Array(200).fill(row),0,200).length,128);
+console.log('PASS: OCR object and legacy text IPC, cache, source preservation, size and count bounds');

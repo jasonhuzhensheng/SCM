@@ -1,0 +1,58 @@
+[
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/config.json",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/config.json",
+    "size": 721,
+    "sha256": "",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/onnx/text_model_quantized.onnx",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/onnx/text_model_quantized.onnx",
+    "size": 124987662,
+    "sha256": "e15106084b59672f1c39a2d5db13eeb7669be5ebf6ad6f7c4f91f717339cdcf1",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/onnx/vision_model_quantized.onnx",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/onnx/vision_model_quantized.onnx",
+    "size": 307331740,
+    "sha256": "ee6c57374a9450be119b3c9f8768ff52ea27bfa521482b0eedeaa90b59a2ba9b",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/preprocessor_config.json",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/preprocessor_config.json",
+    "size": 520,
+    "sha256": "",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/special_tokens_map.json",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/special_tokens_map.json",
+    "size": 472,
+    "sha256": "",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/tokenizer.json",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/tokenizer.json",
+    "size": 2224119,
+    "sha256": "",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "models/Xenova/clip-vit-large-patch14-336/tokenizer_config.json",
+    "url": "https://huggingface.co/Xenova/clip-vit-large-patch14-336/resolve/main/tokenizer_config.json",
+    "size": 775,
+    "sha256": "",
+    "label": "CLIP 照片搜索"
+  },
+  {
+    "path": "llm/models/Qwen3-1.7B-Q4_K_M.gguf",
+    "url": "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+    "size": 1107409472,
+    "sha256": "b139949c5bd74937ad8ed8c8cf3d9ffb1e99c866c823204dc42c0d91fa181897",
+    "label": "Qwen 中文搜索辅助"
+  }
+]

@@ -1,0 +1,22 @@
+'use strict';
+const assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const {openQueryResultCache}=require('../main-lib/query-result-cache');
+const {createCachedSearch}=require('../main-lib/search-result-cache');
+(async()=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'search-cache-integration-'));let cache;try{
+ const file=path.join(root,'query.sqlite');cache=openQueryResultCache(file);
+ let revision='1',busy=false,calls=0;
+ const context=async mode=>busy?null:{libraryId:'test',libraryRevision:revision,modelVersion:'m1',searchVersion:'1',mode};
+ const request=async msg=>msg.type==='query-cache-lookup'?cache.lookup(msg.query,msg.context):cache.store(msg.query,msg.context,msg.result);
+ const wrap=createCachedSearch({context,request});
+ const rank=wrap('visual',async()=>{calls++;const rows=[{filename:'a',score:.9}];rows.queryVec=[1,0];return rows;});
+ await rank('海边',96);const cached=await rank('海边',96);assert.equal(calls,1);assert.equal(cached.queryVec[0],1);assert(Array.isArray(cached));
+ cache.close();cache=openQueryResultCache(file);await rank('海边',96);assert.equal(calls,1,'reopen uses persisted result');
+ revision='2';await rank('海边',96);assert.equal(calls,2);await rank('海边',12);assert.equal(calls,3);busy=true;await rank('海边',12);assert.equal(calls,4);busy=false;
+ let emptyCalls=0;const empty=wrap('visual',async()=>{emptyCalls++;return [];});await empty('none',96);await empty('none',96);assert.equal(emptyCalls,2,'empty fallback is not cached');
+ const fail=wrap('visual',async()=>{throw Error('model unavailable')});await assert.rejects(fail('error'),/unavailable/);
+ let raced=0;const race=wrap('visual',async()=>{raced++;revision=String(Number(revision)+1);return [{filename:'b'}];});await race('race');await race('race');assert.equal(raced,2);
+ let hits=0;const broken=createCachedSearch({context,request:async()=>{throw Error('disk full')}})('visual',async()=>{hits++;return [{filename:'c'}]});await broken('x');await broken('x');assert.equal(hits,2,'cache failure never breaks search');
+ const partial=wrap('visual',async()=>({partial:true,results:[{filename:'x'}]}));await partial('live');
+ const detection=wrap('detection',async()=>({ok:true,filenames:['x'],status:{indexed:1}}));assert.deepEqual(await detection('text','word'),await detection('text','word'));
+ console.log('PASS: worker protocol integration, persisted hits, array queryVec, revision/topK separation, busy bypass, races, fallback/error exclusion and cache failure fallback');
+}finally{cache?.close();fs.rmSync(root,{recursive:true,force:true});}})().catch(e=>{console.error(e);process.exitCode=1});

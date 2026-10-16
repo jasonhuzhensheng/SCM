@@ -269,6 +269,14 @@ const DATA_DIR = path.join(app.getPath("userData"), "library");
 // the first APP_ICON load fall back to default even when a choice is persisted.
 const SETTINGS_FILE = path.join(app.getPath("userData"), "settings.json");
 initSettings({ userDataDir: app.getPath("userData") });
+const adaptiveResources = require("./main-lib/adaptive-resources");
+let pendingResourceEstimate = null;
+const resourceSummary = () => require("./main-lib/library-store").loadedResourceSummary();
+const resourceGate = adaptiveResources.createResourceGate({
+ directory: app.getPath("userData"),
+ reserve: () => adaptiveResources.resourcePlan(resourceSummary()).reserveBytes,
+});
+
 initFailedImports({ dataDir: DATA_DIR });
 initCategoryOverrides({ dataDir: DATA_DIR });
 initLibraryStore({ userDataDir: app.getPath("userData") });
@@ -321,6 +329,20 @@ ipcMain.handle("memories:set-file-lock", (_event, locked) => {
 	} catch { return { ok: false, error: "无法保存文件锁定状态，请重试。" }; }
 });
 ipcMain.handle("memories:get-asset-locks", () => assetLocks.list());
+ipcMain.handle("memories:delete-concurrency", () => {
+ const n=readSettings().deleteVerificationConcurrency;
+ return Number.isInteger(n)&&n>=1&&n<=100?n:10;
+});
+ipcMain.handle("memories:set-delete-concurrency", (_event,n) => {
+ if(!Number.isInteger(n)||n<1||n>100)throw Error("请输入1–100的整数");
+ writeSettings({deleteVerificationConcurrency:n});
+ if(readSettings().deleteVerificationConcurrency!==n)throw Error("保存失败");
+ return n;
+});
+ipcMain.handle("memories:burst-list", async () => {
+ const library=loadLibrary();
+ return require("./main-lib/burst-list.js").list(library.filenames.map((filename,i)=>({filename,source:library.sources[i]})));
+});
 ipcMain.handle("memories:set-asset-locks", (_event, names, locked) => {
  try {
   if (driveTransfer) throw Error("请等待文件传输、删除或副本清理完成。");
@@ -333,11 +355,19 @@ const movedSourcesFile = path.join(app.getPath("userData"), "drive-moved-sources
 let movedSources = {};
 try { movedSources = JSON.parse(fs.readFileSync(movedSourcesFile, "utf8")); } catch { /* first run */ }
 async function persistMovedSource(source) {
-	if (!source) return;
-	try {
-		const stat = await fs.promises.stat(source);
-		movedSources[source] = { size: stat.size, mtimeMs: stat.mtimeMs };
-	} catch { return; }
+ return persistMovedSources([source]);
+}
+async function persistMovedSources(sources) {
+ let changed = false;
+ for (const source of new Set(sources)) {
+  if (!source) continue;
+  try {
+   const stat = await fs.promises.stat(source);
+   movedSources[source] = { size: stat.size, mtimeMs: stat.mtimeMs };
+   changed = true;
+  } catch { /* missing original: its confirmed receipt remains authoritative */ }
+ }
+ if (!changed) return;
 	await fs.promises.writeFile(movedSourcesFile + ".tmp", JSON.stringify(movedSources), { mode: 0o600 });
 	await fs.promises.rename(movedSourcesFile + ".tmp", movedSourcesFile);
 }
@@ -345,22 +375,38 @@ async function wasMovedToDrive(source) {
 	const record = movedSources[source]; if (!record) return false;
 	try { const stat = await fs.promises.stat(source); return stat.size === record.size && stat.mtimeMs === record.mtimeMs; } catch { return false; }
 }
-const driveReply = async task => { try { return { ok: true, ...await task() }; } catch (error) { return { ok: false, error: error.message || "文件操作失败。", ...(Array.isArray(error.results)?{results:error.results}:{}) }; } };
+const driveReply = async task => { try { return { ok: true, ...await task() }; } catch (error) { return { ok: false, error: error.message || "文件操作失败。", ...(Array.isArray(error.results)?{results:error.results}:{}), ...(Array.isArray(error.staleFilenames)?{staleFilenames:error.staleFilenames}:{}) }; } };
+ipcMain.handle("memories:restore-locked-photos", (_event,names,checkOnly=false) => driveReply(async()=>{
+ if(driveTransfer || getFileTasks().snapshot().some(job=>["running","queued","waiting","pausing"].includes(job.status)))throw Error("请等待当前文件任务结束后恢复。");
+ driveTransfer=new AbortController();
+ try {
+  const result=await require("./main-lib/photos-restore").restoreLockedPhotos({names,library:loadLibrary(),isLocked:filename=>assetLocks.has(filename),checkOnly:checkOnly===true,executable:app.isPackaged?path.join(process.resourcesPath,"restore-locked-photos"):path.join(__dirname,"main-lib/native/restore-locked-photos"),directory:path.join(DATA_DIR,"photos-restoration-receipts")});
+  if(!checkOnly)for(const win of BrowserWindow.getAllWindows())win.webContents.send("memories:status",{type:"library-updated"});
+  return result;
+ }finally{driveTransfer=null;}
+}));
 let selectedTransferFolder = null;
 ipcMain.handle("memories:pick-transfer-folder", () => driveReply(async () => {
  if (driveTransfer) throw new Error("请等待当前传输完成。");
- const picked = await dialog.showOpenDialog({ title: "选择 Google Drive 或其他目标文件夹", properties: ["openDirectory", "createDirectory"] });
+ const picked = await dialog.showOpenDialog({ title: "选择 Google Drive 或其他目标文件夹", defaultPath: readSettings().storageTarget?.directory, properties: ["openDirectory", "createDirectory"] });
  if (picked.canceled) return { canceled: true };
  const directory = await fs.promises.realpath(picked.filePaths[0]);
  const managed = await fs.promises.realpath(PHOTOS_DIR);
  if (directory === managed || directory.startsWith(managed + path.sep)) throw new Error("请选择素材库以外的文件夹。");
- selectedTransferFolder = { directory, token: crypto.randomUUID() };
+ const identity = await adaptiveResources.volumeIdentity(directory);
+ await adaptiveResources.validateTarget(identity);
+ selectedTransferFolder = { directory, identity, token: crypto.randomUUID() };
  return { folderPath: directory, token: selectedTransferFolder.token };
 }));
 ipcMain.handle("memories:drive-status", () => driveReply(async () => drive.status()));
-ipcMain.handle("memories:drive-configure", () => driveReply(async () => {
+ipcMain.handle("memories:drive-configure", event => driveReply(async () => {
 	if (driveTransfer) throw new Error("上传期间不能更改账号配置。");
-	const result = await dialog.showOpenDialog({ title: "导入 Google OAuth 桌面应用配置", properties: ["openFile"], filters: [{ name: "OAuth JSON", extensions: ["json"] }] });
+	const parent = BrowserWindow.fromWebContents(event.sender);
+	if (!parent || parent.isDestroyed()) throw new Error("设置窗口已关闭，请重新打开设置。");
+	if (parent.isMinimized()) parent.restore();
+	parent.show(); parent.focus();
+	app.focus({ steal: true });
+	const result = await dialog.showOpenDialog(parent, { title: "导入 Google OAuth 桌面应用配置", defaultPath: app.getPath("downloads"), buttonLabel: "导入配置", properties: ["openFile"], filters: [{ name: "OAuth JSON", extensions: ["json"] }] });
 	if (result.canceled) return { canceled: true };
 	const stat = await fs.promises.stat(result.filePaths[0]); if (stat.size > 65536) throw new Error("配置文件过大。");
 	return drive.configure(JSON.parse(await fs.promises.readFile(result.filePaths[0], "utf8")));
@@ -382,8 +428,8 @@ function getDetectionIndex() {
  }
  return detectionIndex;
 }
-ipcMain.handle("memories:detection-search", (_event, kind, query) => {
- try { if (typeof query !== "string" || query.length > 1000) throw new Error("无效查询"); return {ok:true,...getDetectionIndex().search(kind,query)}; }
+ipcMain.handle("memories:detection-search", async (_event, kind, query) => {
+ try { if (typeof query !== "string" || query.length > 1000) throw new Error("无效查询"); return await cachedDetection(kind,query); }
  catch (error) { return {ok:false,error:error.message}; }
 });
 ipcMain.handle("memories:detection-pause", (_event, paused) => {
@@ -397,34 +443,49 @@ ipcMain.handle("memories:qr-scan", (_event, names, kind="qr") => {
 });
 let fileTaskStore;
 let activeFileTaskID = null;
+let activeTransferTask = null;
 function getFileTasks() {
  if (!fileTaskStore) fileTaskStore = require("./main-lib/file-tasks.js").createFileTasks(path.join(DATA_DIR,"file-tasks.json"), {
   transfer: runTransferTask, delete: runDeleteTask, cleanup: runCleanupTask,
  }, job => {
   if (job.payload.photosDeleteVersion !== 1 && job.payload.rows?.some(row => isPhotosPath(row.source)) && (job.kind === "delete" || (job.kind === "transfer" && job.payload.mode === "move"))) return "旧版照片删除任务需重新选择并确认，已阻止操作图库包内文件";
   if (isQuitting || startupModelPending || migrationState || driveTransfer) return "等待当前文件任务或模型更新完成";
-  if ((job.kind !== "transfer" || job.payload.mode === "move") && filesLocked()) return FILE_LOCK_ERROR;
+  if ((job.kind !== "transfer" || (job.payload.mode === "move" && !(job.payload.localFolder && !job.payload.cloudVerifiedMove && !job.payload.repairOriginals && !job.payload.photoBatchGroup))) && filesLocked()) return FILE_LOCK_ERROR;
   if (job.kind === "cleanup" && importInFlight && !importControl.paused()) return "等待导入暂停或完成后继续清理";
+  if (job.payload.cloudVerifiedMove && !drive.status().metadataConnected) return "等待连接 Google Drive 云端校验：请在设置导入 OAuth 配置并登录；原件保留";
   if (job.kind === "transfer" && !job.payload.localFolder && !drive.status().connected) return "等待 Google Drive 重新连接";
   return "";
  });
  return fileTaskStore;
 }
-const {isPhotosPath,photosOriginal,createPhotoDeletion} = require("./main-lib/photo-deletion.js");
+const {photoSourceIdentity,isPhotosPath,photosOriginal,createPhotoDeletion,sameOriginalIdentity} = require("./main-lib/photo-deletion.js");
 let photoDeletion;
 function getPhotoDeletion() {
  return photoDeletion ||= createPhotoDeletion({executable:app.isPackaged ? path.join(process.resourcesPath,"apple-photos-bridge") : path.join(__dirname,"main-lib/native/apple-photos-bridge"),directory:path.join(DATA_DIR,"photos-deletion-receipts")});
 }
 const taskSignature = stat => [stat.dev,stat.ino,stat.size,stat.mtimeMs,stat.ctimeMs].join(':');
 async function captureTaskRows(names) {
+ require("./main-lib/selection-limit").assertSelectionLimit(names.length);
  const library = loadLibrary(), rows = [];
- for (const filename of names) {
-  const i = library.filenames.indexOf(filename);
-  if (i < 0 || path.basename(filename) !== filename) throw Error("选择包含无效素材");
-  const source = library.sources[i];
+ const stableCapture=require("./main-lib/stable-task-identity").context();
+ // Capture identities before yielding; large selections must not repeatedly scan
+ // the full library or pair a filename with a shifted source after an update.
+ const sources=new Map(library.filenames.map((filename,i)=>[filename,library.sources[i]]));
+ for(const filename of names)if(typeof filename!=="string"||!filename||path.basename(filename)!==filename)throw Error("选择包含无效素材");
+ const missing=names.filter(filename=>!sources.has(filename)&&!assetLocks.has(filename));
+ if(missing.length)throw Object.assign(Error("部分所选素材已不在当前列表中，列表将自动更新。"),{staleFilenames:missing});
+ const selected=names.map(filename=>{
+  if(typeof filename!=="string"||!filename||path.basename(filename)!==filename)throw Error("选择包含无效素材");
+  if(!sources.has(filename))throw Error("部分所选素材已不在当前列表中，请刷新后重新选择。");
+  return {filename,source:sources.get(filename)};
+ });
+ const hidden=await require("./main-lib/photos-trash-state").trashed(selected.map(({filename,source})=>({filenameKey:filename,source})),{fresh:true});
+ const staleFilenames=names.filter(filename=>hidden.has(filename)&&!assetLocks.has(filename));
+ if(staleFilenames.length)throw Object.assign(Error("所选素材已在Apple照片的最近删除中，列表将自动更新；不会重复删除。"),{staleFilenames});
+ for (const {filename,source} of selected) {
   const stat = await fs.promises.stat(path.join(PHOTOS_DIR,filename)).catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
   const originalStat=source&&path.isAbsolute(source)?await fs.promises.lstat(source).catch(e=>{if(e.code!=="ENOENT")throw e;return null;}):null;
-  rows.push({filename,source,signature:stat?taskSignature(stat):null,originalSignature:originalStat?taskSignature(originalStat):null});
+  rows.push({filename,source,signature:stat?taskSignature(stat):null,originalSignature:originalStat?taskSignature(originalStat):null,stableIdentity:await stableCapture.capture(source,originalStat,path.join(PHOTOS_DIR,filename),stat)});
  }
  return rows;
 }
@@ -442,33 +503,44 @@ ipcMain.handle("memories:deletion-space-history", () => getFileTasks().spaceHist
 ipcMain.handle("memories:file-tasks", () => getFileTasks().snapshot());
 ipcMain.handle("memories:file-task-cancel", (_event,id) => {getFileTasks().cancel(id);if(activeFileTaskID===id)driveTransfer?.abort();return getFileTasks().snapshot();});
 ipcMain.handle("memories:file-task-pause", (_event,id) => {getFileTasks().pause(id);if(activeFileTaskID===id)driveTransfer?.abort();return getFileTasks().snapshot();});
+ipcMain.handle("memories:file-task-reveal", (_event,id) => {
+ const task=getFileTasks().snapshot().find(t=>t.id===id&&t.kind==='transfer');
+ if(task?.destination && path.isAbsolute(task.destination))shell.showItemInFolder(task.destination);
+});
 ipcMain.handle("memories:file-task-resume", (_event,id) => {getFileTasks().resume(id);return getFileTasks().snapshot();});
-ipcMain.handle("memories:drive-pause", () => {if(activeFileTaskID){getFileTasks().pause(activeFileTaskID);driveTransfer?.abort();}return {ok:true};});
-ipcMain.handle("memories:drive-cancel", () => {if(activeFileTaskID)getFileTasks().cancel(activeFileTaskID);driveTransfer?.abort();return {ok:true};});
+ipcMain.handle("memories:drive-pause", () => {if(activeTransferTask){getFileTasks().pause(activeTransferTask.id);activeTransferTask.controller.abort();}return {ok:true};});
+ipcMain.handle("memories:drive-cancel", () => {if(activeTransferTask){getFileTasks().cancel(activeTransferTask.id);activeTransferTask.controller.abort();}return {ok:true};});
 ipcMain.handle("memories:drive-transfer", (_event, options) => driveReply(async () => {
  if(options?.mode==="move"&&filesLocked())throw Error(FILE_LOCK_ERROR);
  if(driveTransfer)throw Error("正在传输或删除文件，请等待当前操作结束。");
  if(!Array.isArray(options?.filenames)||!["copy","move"].includes(options?.mode))throw Error("无效的传输请求");
  const names=[...new Set(options.filenames)];
- if(!names.length||names.length>10000||names.some(n=>typeof n!=="string"||path.basename(n)!==n))throw Error("选择包含无效素材");
+ require("./main-lib/selection-limit").assertSelectionLimit(names.length);
+ if(!names.length||names.some(n=>typeof n!=="string"||!n||path.basename(n)!==n))throw Error("选择包含无效素材");
  if(options.mode==="move"&&names.some(n=>assetLocks.has(n)))throw Error(FILE_LOCK_ERROR);
  const localFolder=options.destination==="folder";
  const destination=localFolder&&selectedTransferFolder?.token===options.folderToken?selectedTransferFolder.directory:null;
  if(localFolder&&!destination)throw Error("请重新选择目标文件夹");
  if(!localFolder&&!drive.status().connected)throw Error("请先连接 Google Drive");
  const rows=await captureTaskRows(names);
- return getFileTasks().add("transfer",{rows,photosDeleteVersion:1,mode:options.mode,localFolder,destination,folderName:String(options.folderName||"SayPhoto 搜索结果").slice(0,160)},rows.length).promise;
+ return getFileTasks().add("transfer",{rows,photosDeleteVersion:1,mode:options.mode,localFolder,destination,storageIdentity:localFolder?selectedTransferFolder.identity:null,searchQuery:String(options.searchQuery||"").slice(0,300),folderName:String(options.folderName||"SayPhoto 搜索结果").slice(0,160)},rows.length).promise;
 }));
 function photoAssetKey(source) {
- const match=typeof source==='string' && /^(.*\.photoslibrary)\/originals\/[0-9a-f]\/([0-9a-f-]{36})\.[^/]+$/i.exec(source);
- return match ? `${match[1]}/${match[2].toUpperCase()}` : null;
+ const identity=photoSourceIdentity(source);
+ return identity ? `${identity.library}/${identity.uuid}` : null;
 }
 function photoAssetRows(source) {
  const key=photoAssetKey(source),library=loadLibrary();
  return key ? library.filenames.flatMap((filename,i)=>photoAssetKey(library.sources[i])===key?[{filename,source:library.sources[i]}]:[]) : [];
 }
 function assertPhotoAssetUnlocked(source) {
- if(filesLocked() || photoAssetRows(source).some(row=>assetLocks.has(row.filename)))throw Error(FILE_LOCK_ERROR);
+ if(filesLocked())throw Error(FILE_LOCK_ERROR);
+ const key=photoAssetKey(source);
+ if(!key)return;
+ const library=loadLibrary();
+ // Check lock membership before parsing paths: large libraries must not
+ // normalize every source and allocate an asset-row list for each item.
+ if(library.filenames.some((filename,i)=>assetLocks.has(filename) && photoAssetKey(library.sources[i])===key))throw Error(FILE_LOCK_ERROR);
 }
 async function forgetPhotoAsset(source) {
  for(const row of photoAssetRows(source)) {
@@ -476,17 +548,41 @@ async function forgetPhotoAsset(source) {
   if(!removeLibraryRow(row.filename))throw Error('照片已移到最近删除，但关联搜索记录尚未清理');
  }
 }
+async function verifiedTransferTarget(file, hash, signal) {
+ const stable=stat=>[stat.dev,stat.ino,stat.size,stat.mtimeMs].join(':');
+ for(let attempt=0;attempt<3;attempt++){
+  const before=await fs.promises.lstat(file);
+  if(!before.isFile())throw Error('目标不是普通文件，原件保留');
+  const actual=await require('./main-lib/folder-transfer.js').digest(file,signal);
+  const after=await fs.promises.lstat(file);
+  if(actual!==hash)throw Error('目标内容校验失败，原件保留');
+  if(stable(before)===stable(after))return taskSignature(after);
+ }
+ throw Error('目标在内容校验期间持续变化，原件保留');
+}
 async function backupPhotoResources(job, row, request, exportResources, signal, save) {
- const extras=request.resources.filter(item=>item.hash!==request.hash || item.size!==request.size);
+ const simple=request.verification==='system-copy';
+ const extras=simple?request.resources.filter(item=>item.index!==request.primaryIndex):request.resources.filter(item=>item.hash!==request.hash || item.size!==request.size);
  if(!extras.length)return;
  const current=job.current;
  current.stage='copying-photo-resources';save();
  let directory;
  if(job.payload.localFolder) {
+  if(simple && current.resourcesDirectory){current.previousResourceDirectories ||= [];current.previousResourceDirectories.push(current.resourcesDirectory);delete current.resourcesDirectory;}
   if(!current.resourcesDirectory){current.resourcesDirectory=await fs.promises.mkdtemp(path.join(job.folder.localPath,`${request.uuid}-resources-`));save();}
   directory=current.resourcesDirectory;
   const stat=await fs.promises.lstat(directory);
   if(!stat.isDirectory() || stat.isSymbolicLink() || path.dirname(directory)!==job.folder.localPath)throw Error('配套资源目标已变化，未删除');
+  // Drive may evict a previous attempt's tiny companions. Re-export from Photos
+  // into a fresh owned directory rather than blocking on a cloud placeholder.
+  const existing=await fs.promises.readdir(directory);
+  let evicted=false;
+  for(const name of existing){const item=await fs.promises.lstat(path.join(directory,name));if(item.isFile()&&item.size>0&&item.blocks===0){evicted=true;break;}}
+  if(evicted){
+   current.previousResourceDirectories ||= [];current.previousResourceDirectories.push(directory);
+   current.resourcesDirectory=await fs.promises.mkdtemp(path.join(job.folder.localPath,`${request.uuid}-resources-`));
+   directory=current.resourcesDirectory;current.resourceTargetSignatures=[];current.resourcesVerified=false;save();
+  }
  } else {
   if(current.resourceStaging && !fs.existsSync(current.resourceStaging))delete current.resourceStaging;
   if(!current.resourceStaging){current.resourceStaging=await fs.promises.mkdtemp(path.join(app.getPath('temp'),'sayphoto-resource-upload-'));save();}
@@ -504,13 +600,14 @@ async function backupPhotoResources(job, row, request, exportResources, signal, 
   current.resourceTargetSignatures=[];
   for(const resource of request.resources) {
    const extra=exported.files.find(item=>item.index===resource.index);
-   if(!extra){if(resource.hash!==request.hash || resource.size!==request.size)throw Error('缺少配套资源');manifest.push({...resource,file:job.payload.localFolder?`../${row.filename}`:row.filename});continue;}
+   if(!extra){if(simple ? resource.index!==request.primaryIndex || resource.size!==request.size : resource.hash!==request.hash || resource.size!==request.size)throw Error('缺少配套资源');manifest.push({...resource,file:job.payload.localFolder?`../${row.filename}`:row.filename});continue;}
    const file=extra.path;
    if(path.dirname(file)!==directory)throw Error('无效资源路径');
    const stat=await fs.promises.lstat(file);
-   if(!stat.isFile() || stat.size!==resource.size || await require('./main-lib/folder-transfer.js').digest(file,signal)!==resource.hash)throw Error('配套资源校验失败，原件保留');
-   if(taskSignature(await fs.promises.lstat(file))!==taskSignature(stat))throw Error('配套资源在校验时变化');
-   if(job.payload.localFolder)current.resourceTargetSignatures.push({file,signature:taskSignature(stat)});
+   if(!stat.isFile() || (simple ? stat.size!==extra.size : stat.size!==resource.size))throw Error('配套资源校验失败，原件保留');
+   if(simple)resource.size=extra.size;
+   const verifiedSignature=simple?taskSignature(stat):await verifiedTransferTarget(file,resource.hash,signal);
+   if(job.payload.localFolder)current.resourceTargetSignatures.push({file,signature:verifiedSignature,hash:resource.hash});
    const name=job.payload.localFolder?path.basename(file):`${request.uuid}-${path.basename(file)}`;
    if(!job.payload.localFolder){
     const key=`${resource.index}-${resource.hash}`;current.resourceUploads[key] ||= {};save();
@@ -528,7 +625,8 @@ async function backupPhotoResources(job, row, request, exportResources, signal, 
   if(!job.payload.localFolder){await fs.promises.rm(directory,{recursive:true,force:true});delete current.resourceStaging;save();}
  }
 }
-async function trashTransferredOriginal(job, row, file, signal, save, stopped) {
+async function trashTransferredOriginal(job, row, file, signal, save, stopped, prepareOnly = false) {
+ if(job.payload.localFolder && job.payload.storageIdentity) await adaptiveResources.validateTarget(job.payload.storageIdentity);
  const current = job.current;
  if (current.originalTrashed) return;
  if (current.photos?.requested) {
@@ -539,39 +637,47 @@ async function trashTransferredOriginal(job, row, file, signal, save, stopped) {
  let before;
  try { before = await fs.promises.lstat(row.source); }
  catch (error) { if (error.code === "ENOENT") throw Error("原文件已缺失，无法确认删除结果，未计入统计"); throw error; }
- if (!before.isFile() || taskSignature(before) !== row.originalSignature) throw Error("原文件已变化，未继续删除");
+ if (!before.isFile() || (taskSignature(before)!==row.originalSignature && !(isPhotosPath(row.source)&&sameOriginalIdentity(taskSignature(before),row.originalSignature)))) throw Error("原文件已变化，未继续删除");
  const { digest } = require("./main-lib/folder-transfer.js");
  const target = job.payload.localFolder ? current.remote?.localPath : file;
  if (!target) throw Error("目标文件不可用，已保留原文件");
  const targetBefore = await fs.promises.lstat(target);
  if ((job.payload.localFolder && !targetBefore.isFile()) || (await fs.promises.stat(target)).size !== before.size) throw Error("目标类型或大小不一致，已保留原文件");
- const originalHash = await digest(row.source, signal);
- if (originalHash !== await digest(target, signal)) throw Error("原文件与已校验的目标内容不一致，已保留原文件");
+ const proof=job.payload.localFolder ? await require("./main-lib/folder-transfer.js").verifiedCopy(row.source,target) : null;
+ const simple=job.payload.localFolder && !job.payload.cloudVerifiedMove && current.deferredCopy?.verification==='system-copy';
+ if(simple && (taskSignature(targetBefore)!==current.deferredCopy.targetSignature || !sameOriginalIdentity(taskSignature(before),current.deferredCopy.sourceSignature)))throw Error('系统复制记录已变化，原件保留');
+ const originalHash = simple ? undefined : proof?.hash || await digest(row.source, signal);
+ let verifiedTarget=simple?taskSignature(targetBefore):proof?.targetSignature || await verifiedTransferTarget(target,originalHash,signal);
  if (job.payload.localFolder) {
   const targetStat = await fs.promises.stat(target);
   if (targetStat.dev === before.dev && targetStat.ino === before.ino) throw Error("目标与原文件相同，未删除");
  }
  const targetAfter = await fs.promises.lstat(target);
- if (taskSignature(targetAfter) !== taskSignature(targetBefore)) throw Error("校验期间目标文件已变化，已保留原文件");
+ if (taskSignature(targetAfter) !== verifiedTarget) throw Error("校验期间目标文件已变化，已保留原文件");
  const after = await fs.promises.lstat(row.source);
- if (taskSignature(after) !== row.originalSignature) throw Error("校验期间原文件已变化，未删除");
+ if (taskSignature(after)!==row.originalSignature && !(isPhotosPath(row.source)&&sameOriginalIdentity(taskSignature(after),row.originalSignature))) throw Error("校验期间原文件已变化，未删除");
  signal.throwIfAborted();
  if (stopped()) throw Error("移动已停止，原文件保留");
- if (filesLocked() || assetLocks.has(row.filename)) throw Error(FILE_LOCK_ERROR);
+ if (!(prepareOnly && job.payload.localFolder) && (filesLocked() || assetLocks.has(row.filename))) throw Error(FILE_LOCK_ERROR);
  const photos = await photosOriginal(row.source);
  current.stage = photos ? "photos-deleting" : "trashing-original"; save();
  let deletedBytes=before.size,deletedCount=1;
  if (photos) {
+  if(prepareOnly){current.resourceTargetSignatures=[];current.resourcesVerified=false;save();}
   const result=await getPhotoDeletion().remove(row.source,row.originalSignature,current,save,signal,originalHash,{
+   prepareOnly, verification:simple?'system-copy':undefined,
    beforeDelete:async()=>{
-    assertPhotoAssetUnlocked(row.source);signal.throwIfAborted();
+    if(!(prepareOnly && job.payload.localFolder))assertPhotoAssetUnlocked(row.source);signal.throwIfAborted();
     if(stopped())throw Error("移动已暂停，原件保留");
-    if(taskSignature(await fs.promises.lstat(target))!==taskSignature(targetBefore))throw Error("目标在校验后发生变化，原件保留");
-    for(const item of current.resourceTargetSignatures || [])if(taskSignature(await fs.promises.lstat(item.file))!==item.signature)throw Error("配套资源目标已变化，原件保留");
+    if(taskSignature(await fs.promises.lstat(target))!==verifiedTarget){if(simple)throw Error('目标已变化，原件保留');verifiedTarget=await verifiedTransferTarget(target,originalHash,signal);}
+    for(const item of current.resourceTargetSignatures || [])if(taskSignature(await fs.promises.lstat(item.file))!==item.signature){if(simple)throw Error('配套资源已变化，原件保留');item.signature=await verifiedTransferTarget(item.file,item.hash,signal);}
     if(!job.payload.localFolder)await drive.upload(file,row.filename,job.folder.id,signal,()=>{},current.upload,save);
    },
    backup:(request,exportResources)=>backupPhotoResources(job,row,request,exportResources,signal,save),
   });
+  if(result.prepared){
+   current.photoTarget={file:target,signature:verifiedTarget,hash:originalHash};save();return;
+  }
   deletedBytes=result.size;deletedCount=result.count;
  }
  else {
@@ -591,12 +697,284 @@ function finishTransferItem(job, filename, save) {
  job.results.push({filename,ok:true,url:job.current.remote?.webViewLink || ""});
  job.done++; job.current = null; save();
 }
+// Prepare every Photos row before one PhotoKit commit. Successful rows are only
+// counted by the existing finalization loop after the batch receipt is verified.
+async function servicePendingDeletes(job, controller) {
+ // Called outside filesystem/PhotoKit transactions; keep the parent controller.
+ if (controller.signal.aborted) return;
+ driveTransfer = null;
+ try { await getFileTasks().runPendingDeletes(job.id); }
+ finally { driveTransfer = controller; activeFileTaskID = job.id; }
+ controller.signal.throwIfAborted();
+}
+async function prepareTransferredPhotoBatch(job, save, stopped, signal, emit) {
+ if(job.payload.mode!=="move")return;
+ if(job.payload.cloudVerifiedMove){
+  const policy=job.payload.cloudVerifiedMove;
+  if(policy.version!==1||!job.payload.localFolder||job.payload.photoBatchGroup||job.payload.repairOriginals)throw Error('不支持的小批云端校验任务，原件保留');
+  if(!drive.status().metadataConnected)throw Error('请先连接 Google Drive 云端校验');
+  await drive.verifyFolder(policy.folderId,path.basename(job.folder.localPath),signal);
+  if(job.photoBatch?.confirmed && job.photoBatch.entries.every(e=>e.index<job.done)){
+   emit({filename:'',phase:'release-local',percent:100});
+   if(!await require('./main-lib/cloud-batch').released(job.photoBatch,drive,signal))throw Error('本批已完成移动；请在访达对已完成文件选择“移除下载”，不要删除文件。释放后自动继续下一批');
+   job.photoBatch.localReleased=true;
+   job.photoBatchHistory ||= [];job.photoBatchHistory.push(job.photoBatch);job.photoBatch=null;save();
+  }
+  if(!job.photoBatch){
+   const entries=require('./main-lib/cloud-batch').selectBatch((job.cloudPendingEntries||[]).filter(e=>!job.photosHandled?.[photoAssetKey(job.payload.rows[e.index].source)]),job.payload.rows,job.done,policy);
+   if(!entries.length){if(job.done<job.total)throw Error('小批任务缺少待处理记录');return;}
+   job.photoBatch={entries};save();
+  }
+ }
+ const members=job.payload.photoBatchGroup?getFileTasks().photoBatchJobs(job):[job];
+ const coordinator=members[0];
+ if(coordinator.photoBatch?.confirmed){
+  if(job!==coordinator&&!job.photoBatch?.confirmed){job.photoBatch={...coordinator.photoBatch,entries:coordinator.photoBatch.entries.filter(entry=>entry.jobId===job.id)};save();}
+  return;
+ }
+ if(job!==coordinator)throw Error('等待合并批次统一校验及删除');
+ const ownerOf=entry=>members.find(member=>member.id===entry.jobId)||job;
+ // Finish/reconcile an in-flight legacy single-asset transaction first.
+ if(!job.photoBatch && (job.current?.photos?.requested || job.current?.originalTrashed))return;
+ if(!job.photoBatch){
+  const entries=[];
+  for(const member of members){
+   if(member.current?.photos?.requested||member.current?.originalTrashed)throw Error('合并批次仍有在途事务，必须先核对回执');
+   for(let index=member.done;index<member.payload.rows.length;index++){
+    const row=member.payload.rows[index];
+    if(member.photosHandled?.[photoAssetKey(row.source)])continue;
+    signal.throwIfAborted();if(stopped())throw Error('原件识别已暂停，原文件保留');
+    emit({filename:row.filename,phase:'identifying',percent:0,currentBytes:0,currentTotal:0,transferredBytes:0});
+    try {
+     if(await photosOriginal(row.source,{signal,progress:(sent,size)=>emit({filename:row.filename,phase:'identifying',percent:size?Math.floor(sent/size*100):0,currentBytes:sent,currentTotal:size,transferredBytes:0})}))entries.push({jobId:member.id,index,journal:index===member.done&&member.current?member.current:{filename:row.filename,stage:'copying',upload:{}}});
+    } catch(error) { if(error.retryable===false)error.message=row.filename+'：'+error.message;throw error; }
+   }
+  }
+  if(!entries.length)return;
+  job.photoBatch={entries};save();
+ }
+ const batch=job.photoBatch;
+ const isolated=job.payload.localFolder && !job.payload.cloudVerifiedMove && !job.payload.repairOriginals && !job.payload.photoBatchGroup;
+ if(isolated)batch.isolated=true;
+ if(job.payload.localFolder && !job.payload.cloudVerifiedMove && !job.payload.repairOriginals && !job.payload.photoBatchGroup && !batch.requested && !batch.commitSubset?.requested && !batch.confirmed && !job.copyFirstComplete){
+  await require('./main-lib/local-copy-first').copyAll(job,save,stopped,signal,emit,async row=>{
+   await servicePendingDeletes(job,driveTransfer);
+   const library=loadLibrary(),index=library.filenames.indexOf(row.filename);
+   if(index<0||library.sources[index]!==row.source)throw Error('素材来源已变化');
+  });
+ }
+ if(!batch.requested && !batch.commitSubset?.requested && !batch.preparedOnly){
+  // Each slot runs at most one native PhotoKit verification/export process.
+  // Drain a wave before servicing other delete tasks or submitting this batch.
+  const concurrency=isolated?10:1;
+  batch.verificationConcurrency=concurrency;batch.activeVerifications=0;batch.preparedCount=0;
+  const prepareEntry=async entry=>{
+   if(isolated && entry.journal.copyError)return;
+   const saveEntry=isolated&&!entry.journal.photos?.requested?()=>save({checkpoint:true}):save;
+   batch.activeVerifications++;
+   try {
+   signal.throwIfAborted();if(stopped())throw Error('移动已暂停，照片批量删除尚未提交');
+   const owner=ownerOf(entry),row=owner.payload.rows[entry.index],current=entry.journal;
+   if(['paused','pausing','cancelled'].includes(owner.status))throw Error('合并批次中的任务已暂停');
+   if(!isolated){if(filesLocked()||assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);assertPhotoAssetUnlocked(row.source);}
+   else {delete current.validationError;current.retainOriginal=false;try{if(filesLocked()||assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);assertPhotoAssetUnlocked(row.source);}catch{current.retainOriginal=true;}}
+   if(!owner.payload.repairOriginals){
+    const library=loadLibrary(),index=library.filenames.indexOf(row.filename);
+    if(index<0||library.sources[index]!==row.source)throw Error('素材来源已变化，未提交批量删除');
+   }
+   const stat=await fs.promises.lstat(row.source);
+   if(!stat.isFile()||!sameOriginalIdentity(taskSignature(stat),row.originalSignature))throw Error('原文件已变化，未提交批量删除');
+   emit({done:job.done,total:job.total,filename:row.filename,percent:0,phase:"copying",currentBytes:0,currentTotal:stat.size,transferredBytes:0});
+   const onProgress=(sent,size,phase="copying")=>emit({filename:row.filename,phase,percent:size?Math.floor(sent/size*100):100,currentBytes:sent,currentTotal:size,transferredBytes:phase==="copying"?sent:stat.size});
+   if(owner.payload.localFolder && (owner.payload.cloudVerifiedMove || owner.payload.repairOriginals || current.photosPrepared?.verification==='system-copy') && require("./main-lib/cloud-batch").preparedResourcesComplete(current)){
+    const targets=[current.photoTarget,...(current.resourceTargetSignatures||[])];
+    let reusable=true;
+    for(const item of targets){try{if(taskSignature(await fs.promises.lstat(item.file))!==item.signature)reusable=false;}catch{reusable=false;}}
+    if(reusable){batch.preparedCount++;saveEntry();return;}
+   }
+   if(owner.payload.cloudVerifiedMove && !current.remote){const disk=await fs.promises.statfs(owner.folder.localPath);if(disk.bavail*disk.bsize<stat.size+2*1024**3)throw Error('可用磁盘空间不足，至少保留文件大小加2 GiB余量；已暂停新增复制');}
+   const view={...owner,current};
+   if(owner.payload.repairOriginals)current.remote={localPath:path.join(owner.folder.localPath,row.filename)};
+   else current.remote=owner.payload.localFolder?{localPath:await (owner.payload.cloudVerifiedMove || owner.payload.repairOriginals ? require('./main-lib/local-copy-first').verifyOrRepair(row.source,row.filename,owner.folder.localPath,signal,onProgress,owner.id,current,saveEntry) : require('./main-lib/local-copy-first').simpleCopy(row.source,row.filename,owner.folder.localPath,signal,onProgress,current,saveEntry))}:await drive.upload(row.source,row.filename,owner.folder.id,signal,onProgress,current.upload,save);
+   saveEntry();
+   emit({filename:row.filename,phase:"resources",percent:100});
+   await trashTransferredOriginal(view,row,row.source,signal,saveEntry,stopped,true);
+   batch.preparedCount++;saveEntry();
+   emit({done:job.done,total:job.total,filename:row.filename,percent:100,phase:"prepared"});
+   }catch(error){
+    if(!isolated || signal.aborted || stopped())throw error;
+    entry.journal.validationError=error.message;saveEntry();
+   }finally{batch.activeVerifications--;}
+  };
+  try {
+   for(let offset=0;offset<batch.entries.length;offset+=concurrency){
+    await servicePendingDeletes(job,driveTransfer);
+    signal.throwIfAborted();if(stopped())throw Error('移动已暂停，照片批量删除尚未提交');
+    const results=await Promise.allSettled(batch.entries.slice(offset,offset+concurrency).map(prepareEntry));
+    save({checkpoint:!!isolated});
+    const failure=results.find(result=>result.status==='rejected');
+    if(failure)throw failure.reason;
+   }
+  }finally{batch.activeVerifications=0;save();}
+ }
+ emit({filename:"",phase:"final-verification",percent:0,currentBytes:0,currentTotal:0});
+ if(isolated && !batch.commitSubset?.requested){
+  batch.commitSubset={allowEmpty:true,entries:batch.entries.filter(e=>!e.journal.copyError&&!e.journal.validationError&&!e.journal.retainOriginal&&e.journal.photosPrepared)};save();
+ }
+ const commitBatch=isolated?batch.commitSubset:batch;
+ if(isolated && !commitBatch.entries.length){batch.confirmed=true;save();return;}
+ await getPhotoDeletion().commitBatch(commitBatch,save,signal,async()=>{
+  const guards=[];
+  for(const entry of [...commitBatch.entries]){
+   const start=guards.length;
+   try {
+   await servicePendingDeletes(job, driveTransfer);
+   const owner=ownerOf(entry),row=owner.payload.rows[entry.index],current=entry.journal;
+   if(stopped()||['paused','pausing','cancelled'].includes(owner.status))throw Error('移动已暂停，未提交删除');
+   if(filesLocked()||assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);
+   assertPhotoAssetUnlocked(row.source);
+   for(const item of [{file:row.source,signature:row.originalSignature,hash:current.photosPrepared.hash,original:true},current.photoTarget,...(current.resourceTargetSignatures||[])]){
+    if(!item)throw Error('缺少批量目标校验记录');
+    const presentSignature=taskSignature(await fs.promises.lstat(item.file));
+    if(item.original&&!sameOriginalIdentity(presentSignature,item.signature))throw Error('整批核对期间原件身份或内容时间已变化');
+    if(presentSignature!==item.signature){
+     if(current.photosPrepared.verification==='system-copy' || !item.hash)throw Error('整批核对期间原件或目标已变化');
+     item.signature=await verifiedTransferTarget(item.file,item.hash,signal);
+    }
+    const stat=await fs.promises.lstat(item.file,{bigint:true});
+    guards.push({path:item.file,dev:String(stat.dev),ino:String(stat.ino),size:String(stat.size),mtimeNs:String(stat.mtimeNs),ctimeNs:String(stat.ctimeNs),...(item.hash?{hash:item.hash}:{})});
+   }
+   if(owner.payload.cloudVerifiedMove){
+    emit({filename:row.filename,phase:'cloud-verifying',percent:0});
+    current.cloudVerified=await require('./main-lib/cloud-batch').verifyEntry(owner,entry,drive,signal);save();
+   }
+   if(!owner.payload.localFolder)await drive.upload(row.source,row.filename,owner.folder.id,signal,()=>{},current.upload,save);
+   }catch(error){
+    if(!isolated || signal.aborted || stopped())throw error;
+    guards.length=start;
+    if(error.message===FILE_LOCK_ERROR)entry.journal.retainOriginal=true;
+    else entry.journal.validationError=error.message;
+    commitBatch.entries=commitBatch.entries.filter(e=>e!==entry);save();
+   }
+  }
+  return guards;
+ });
+ if(isolated){
+  for(const committed of commitBatch.entries){const original=batch.entries.find(e=>e.index===committed.index);if(original)original.journal=committed.journal;}
+  batch.confirmed=true;save();
+ }
+}
+// Only finalize receipts already confirmed by PhotoKit. No copy or deletion is
+// dispatched here. Durable task progress advances only after the index checkpoint.
+async function cleanupConfirmedTransferBatch(job,save,stopped,emit) {
+ if(job.payload.mode!=="move" || !job.photoBatch?.confirmed)return false;
+ const entries=[];
+ for(let index=job.done;index<Math.min(job.done+250,job.payload.rows.length);index++){
+  const entry=job.photoBatch.entries.find(e=>e.index===index&&(!e.jobId||e.jobId===job.id));
+  if(!entry?.journal.photos?.requested || !entry.journal.originalTrashed)break;
+  entries.push(entry);
+ }
+ if(!entries.length||stopped())return false;
+ const keys=new Set(entries.map(e=>photoAssetKey(job.payload.rows[e.index].source)));
+ if(keys.has(null))throw Error("已确认照片缺少素材身份，索引保留");
+ const library=loadLibrary(),rows=[];
+ // One library scan per checkpoint instead of one scan per removed asset.
+ for(let i=0;i<library.filenames.length;i++){
+  if(keys.has(photoAssetKey(library.sources[i])))rows.push({filename:library.filenames[i],source:library.sources[i]});
+ }
+ for(const row of rows)if(filesLocked()||assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);
+ if(stopped())return false;
+ emit({done:job.done,total:job.total,filename:"",phase:"index-cleanup",percent:0});
+ await persistMovedSources(rows.map(row=>row.source));
+ for(const row of rows){
+  if(filesLocked()||assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);
+  dropQueuedJobsFor(row.filename);
+  if(!removeLibraryRow(row.filename))throw Error("照片已删除，索引清理尚未完成");
+  await new Promise(resolve=>setImmediate(resolve));
+ }
+ await saveLibrary({strict:true});
+ // The index is durable. Advance this confirmed group synchronously, then
+ // persist once; never rewrite the entire task for every member of the group.
+ for(const entry of entries){job.current=entry.journal;finishTransferItem(job,job.payload.rows[job.done].filename,()=>{});}
+ save();
+ emit({done:job.done,total:job.total,filename:"",phase:"index-cleanup",percent:100});
+ return true;
+}
+
+const targetResourceGates = new Map();
+async function reserveTransferStorage(job) {
+ const p = job.payload;
+ if (!p.localFolder || !p.storageIdentity) return () => {};
+ await adaptiveResources.validateTarget(p.storageIdentity);
+ const [targetStat, appStat] = await Promise.all([fs.promises.stat(p.destination), fs.promises.stat(app.getPath("userData"))]);
+ let gate = resourceGate;
+ if (targetStat.dev !== appStat.dev) {
+  gate = targetResourceGates.get(p.storageIdentity.uuid);
+  if (!gate) {
+   gate = adaptiveResources.createResourceGate({ directory: p.destination });
+   if (targetResourceGates.size >= 16) targetResourceGates.delete(targetResourceGates.keys().next().value);
+   targetResourceGates.set(p.storageIdentity.uuid, gate);
+  }
+ }
+ let bytes = 256 * 1024 * 1024;
+ for (const row of p.rows.slice(job.done)) {
+  const size = Number((row.originalSignature || row.signature || "").split(":")[2]);
+  if (!Number.isSafeInteger(size) || size < 0) throw Error("无法评估待传输文件大小，请恢复来源连接后重试。");
+  bytes += size;
+ }
+ await gate.refresh();
+ const release = gate.acquire(bytes);
+ if (!release) throw Error(gate.reason(bytes) || "等待目标磁盘空间");
+ release.check = async () => {
+  await adaptiveResources.validateTarget(p.storageIdentity);
+  const space = await adaptiveResources.probeSpace(p.destination);
+  const floor = targetStat.dev === appStat.dev ? adaptiveResources.resourcePlan(resourceSummary()).reserveBytes : 2 * adaptiveResources.GiB;
+  if (space.freeBytes == null || space.freeBytes < floor) throw Error("等待目标磁盘空间恢复，传输任务与原件保留。");
+ };
+ return release;
+}
+
 async function runTransferTask(job, save, stopped) {
- const p=job.payload, controller=new AbortController();driveTransfer=controller;activeFileTaskID=job.id;
- const emit=payload=>{for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:drive-progress",payload);};
+ let releaseStorage = () => {};
+ const p=job.payload, controller=new AbortController();driveTransfer=controller;activeFileTaskID=job.id;activeTransferTask={id:job.id,controller};
+ let lastProgressAt=0;
+ const emit=payload=>{
+  const previous=job.transferProgress;
+  job.transferProgress={...(previous?.filename===payload.filename?previous:{}),...payload};
+  const now=Date.now();
+  if(now-lastProgressAt<150)return;
+  lastProgressAt=now;
+  const progress=require('./main-lib/transfer-progress').transferProgress(job);
+  for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:drive-progress",progress);
+ };
  try{
-  if(!job.folder){job.folder=p.localFolder?{localPath:await fs.promises.mkdtemp(path.join(p.destination,"SayPhoto 搜索结果-"))}:await drive.createFolder(p.folderName,controller.signal);save();}
-  while(job.done<p.rows.length&&!stopped()){
+  releaseStorage = await reserveTransferStorage(job);
+  if(p.localFolder && p.storageIdentity) await adaptiveResources.validateTarget(p.storageIdentity);
+  if(!job.folder){job.folder=p.localFolder?await require("./main-lib/transfer-folder-info").createFolder(p.destination,p.searchQuery):await drive.createFolder(p.folderName,controller.signal);save();}
+  await require('./main-lib/task-volume-identity').prepareLocalResume(job,save,controller.signal);
+  await require('./main-lib/stable-task-identity').resume(job,save);
+  while((job.done<p.rows.length || (p.cloudVerifiedMove && job.photoBatch))&&!stopped()){
+   await releaseStorage.check?.();
+   await servicePendingDeletes(job, controller);
+   if(stopped())break;
+   if(p.cloudVerifiedMove && job.done<p.rows.length && job.photosHandled?.[photoAssetKey(p.rows[job.done].source)] && !job.photoBatch?.entries.some(e=>e.index===job.done)){
+    job.current={filename:p.rows[job.done].filename,stage:'removing',originalTrashed:true};
+    finishTransferItem(job,p.rows[job.done].filename,save);continue;
+   }
+   await prepareTransferredPhotoBatch(job,save,stopped,controller.signal,emit);
+   if(job.done>=p.rows.length)break;
+   if(await cleanupConfirmedTransferBatch(job,save,stopped,emit))continue;
+   if(stopped())break;
+   const excluded=job.photoBatch?.isolated && job.photoBatch.confirmed && job.photoBatch.entries.find(e=>e.index===job.done&&!e.journal.originalTrashed);
+   if(excluded){
+    const j=excluded.journal,error=j.copyError||j.validationError||(j.retainOriginal?'已复制并校验，锁定原件保留':'未完成移动，原件保留');
+    job.results.push({filename:p.rows[job.done].filename,ok:false,error,retained:!!j.retainOriginal,copied:!!j.remote});
+    job.done++;job.current=null;save({checkpoint:true});await new Promise(resolve=>setImmediate(resolve));continue;
+   }
+   const prepared=job.photoBatch?.confirmed && job.photoBatch.entries.find(entry=>entry.index===job.done&&(!entry.jobId||entry.jobId===job.id));
+   if(job.photoBatch?.confirmed && job.photoBatch.partial && !prepared){job.status="paused";save();break;}
+   if(p.cloudVerifiedMove && !prepared)throw Error("尚未通过小批云端核验，禁止删除原件");
+   if(prepared){job.current=prepared.journal;save();}
    const row=p.rows[job.done], filename=row.filename;
    if(!job.current){job.current={filename,stage:"copying",upload:{}};save();}
    if (p.repairOriginals) {
@@ -606,7 +984,7 @@ async function runTransferTask(job, save, stopped) {
     await trashTransferredOriginal(job,row,null,controller.signal,save,stopped);
     if(job.current.photos?.requested && job.current.originalTrashed){await forgetPhotoAsset(row.source);await saveLibrary();}
     finishTransferItem(job,filename,save);
-    emit({done:job.done,total:job.total,filename,percent:100});
+    emit({done:job.done,total:job.total,filename,percent:100,phase:"finished"});
     continue;
    }
    const library=loadLibrary(),index=library.filenames.indexOf(filename);
@@ -622,14 +1000,22 @@ async function runTransferTask(job, save, stopped) {
    if(!file || !path.isAbsolute(file) || !row.originalSignature) throw Error("原文件路径或签名不可用，未执行传输");
    if (job.current.photos?.requested && !job.current.originalTrashed) await trashTransferredOriginal(job,row,file,controller.signal,save,stopped);
    let missing=!!job.current.originalTrashed;
-   if (!missing) try{const stat=await fs.promises.lstat(file);if(!stat.isFile() || taskSignature(stat)!==row.originalSignature)throw Error("源文件已改变，未继续传输");}
+   if (!missing) try{const stat=await fs.promises.lstat(file);if(!stat.isFile() || taskSignature(stat)!==row.originalSignature){
+    // A changed ordinary source must not block receipt cleanup for later items.
+    // Preserve both source and existing destination; never re-copy or delete it.
+    job.results.push({filename,ok:false,retained:true,skipped:true,error:"文件状态有变化，已保留并跳过"});
+    job.done++;job.current=null;job.error="";
+    job.transferProgress={done:job.done,total:job.total,filename,phase:"finished",percent:100};
+    save({checkpoint:true});await new Promise(resolve=>setImmediate(resolve));continue;
+   }} 
    catch(e){if(e.code==='ENOENT'&&job.current.stage==='removing')missing=true;else throw e;}
    if(!missing){
-    const onProgress=(sent,size)=>emit({done:job.done,total:job.total,filename,percent:size?Math.floor(sent/size*100):100});
-    const remote=p.localFolder?{localPath:await require("./main-lib/folder-transfer.js").copyResumable(file,filename,job.folder.localPath,controller.signal,onProgress,job.id)}:await drive.upload(file,filename,job.folder.id,controller.signal,onProgress,job.current.upload,save);
+    const onProgress=(sent,size,phase="copying")=>emit({done:job.done,total:job.total,filename,phase,percent:size?Math.floor(sent/size*100):100,currentBytes:sent,currentTotal:size,transferredBytes:phase==="copying"?sent:Number(row.originalSignature.split(":")[2])});
+    const remote=p.localFolder?{localPath:await require("./main-lib/local-copy-first.js").simpleCopy(file,filename,job.folder.localPath,controller.signal,onProgress,job.current,save)}:await drive.upload(file,filename,job.folder.id,controller.signal,onProgress,job.current.upload,save);
     controller.signal.throwIfAborted();if(stopped())break;
     job.current.remote=remote;job.current.stage="copied";save();
     if(p.mode==="move"){
+     emit({filename,phase:"resources",percent:100});
      await trashTransferredOriginal(job,row,file,controller.signal,save,stopped);
     }
    }
@@ -642,10 +1028,10 @@ async function runTransferTask(job, save, stopped) {
     await saveLibrary();
    }
    finishTransferItem(job,filename,save);
-   emit({done:job.done,total:job.total,filename,percent:100});
+   emit({done:job.done,total:job.total,filename,percent:100,phase:"finished"});
   }
   return {results:job.results,canceled:stopped(),folderUrl:job.folder.webViewLink||"",folderPath:job.folder.localPath||""};
- }finally{driveTransfer=null;activeFileTaskID=null;for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:status",{type:"library-updated"});}
+ }finally{releaseStorage();activeTransferTask=null;driveTransfer=null;activeFileTaskID=null;for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:status",{type:"library-updated"});}
 }
 
 // App icon (Dock + BrowserWindow). Users pick one of the 1024×1024 PNGs in
@@ -1241,27 +1627,16 @@ async function healPhraseBin() {
 // Indexer worker pool (utilityProcess — plain Node, exactly the environment
 // the site's build script runs in).
 //
-// A small pool of workers, each holding its own CLIP model, lets import
-// batches embed several files at once and keeps search queries from queueing
-// behind a long video embed. The first worker ("primary") is spawned eagerly
-// and drives the AI status LED + first-run download; extra workers are forked
-// only after the primary's model is ready (a first launch must never race the
-// download). Dispatch is round-robin over live workers; import batches
-// collect replies in file order (see importPaths).
-//
-// Note: on this machine ONNX Runtime already saturates all cores for a
-// single run and ignores thread-count env vars, so measured E2E import time
-// is fastest with a single worker (7.0s vs 7.5s at 2-3 workers on the smoke
-// batch). Pool size > 1 buys query responsiveness during imports (a search
-// no longer queues behind a multi-second video embed) and headroom for GPU
-// workers, at the cost of aggregate embed throughput. The default follows
-// the measurement; INDEXER_POOL_SIZE=2/3 opts into the pool.
+// Import grows to the configured hardware-capped process count after the model is ready,
+// avoiding concurrent first-run downloads. Idle extras retire after the batch.
+// Dispatch chooses the least busy worker; results are committed in file order.
 // ---------------------------------------------------------------------------
 
-const INDEXER_POOL_SIZE = Math.max(
-	1,
-	Number(process.env.INDEXER_POOL_SIZE) || 1,
-);
+const INDEXER_POOL_SIZE = Math.max(1, Math.min(10,
+	Math.floor(Number(process.env.INDEXER_POOL_SIZE) || 1)));
+const { importPerformance, validateProcesses } = require("./main-lib/import-performance");
+let activeImportProcesses = null;
+let indexerPoolTarget = INDEXER_POOL_SIZE;
 
 let indexerWorkers = []; // { process, primary, ready, dead, pending }
 let indexerReady = null; // primary worker's init-done promise
@@ -1541,7 +1916,7 @@ function createIndexerWorker({ primary = false } = {}) {
 			path.join(__dirname, "indexer", "indexer.js"),
 			[],
 			{
-				env: indexerEnv(),
+				env: { ...indexerEnv(), INDEXER_INFERENCE_THREADS: "1" },
 				serviceName: primary
 					? "clip-indexer"
 					: `clip-indexer-${indexerWorkers.length}`,
@@ -1716,6 +2091,7 @@ function createIndexerWorker({ primary = false } = {}) {
 				clearTimeout(timer);
 				if (msg.ok) r(msg);
 				else j(new Error(msg.error || "Indexer request failed"));
+				trimIndexerPool();
 			}
 		});
 		worker.process.on("exit", (...args) => {
@@ -1769,6 +2145,16 @@ function createIndexerWorker({ primary = false } = {}) {
 	return worker;
 }
 
+// Retire only idle extra processes. In-flight work always gets its reply.
+function trimIndexerPool() {
+	let excess = indexerWorkers.filter(w => !w.dead).length - indexerPoolTarget;
+	for (const worker of [...indexerWorkers].reverse()) {
+		if (excess <= 0) break;
+		if (worker.primary || worker.dead || worker.pending.size) continue;
+		try { worker.process.kill(); worker.dead = true; excess--; } catch { /* retry on next reply */ }
+	}
+}
+
 function spawnIndexer() {
 	if (indexerWorkers.some((w) => !w.dead)) {
 		// Pool already alive — top it up (e.g. after a worker exited).
@@ -1793,19 +2179,21 @@ async function growPool() {
 	} catch {
 		return; // primary init failed; extras can't help
 	}
-	while (indexerWorkers.filter((w) => !w.dead).length < INDEXER_POOL_SIZE) {
+	while (indexerWorkers.filter((w) => !w.dead).length < indexerPoolTarget) {
 		indexerWorkers.push(createIndexerWorker({ primary: false }));
 	}
 }
 
-// Round-robin dispatch across live workers; queries and batch embeds share
-// the pool (a query landing on a busy worker is an edge case, not the norm).
+// Least-loaded dispatch avoids queueing behind a long video when others are idle.
+// Rotate equal-load candidates so all processes share the work.
 function askIndexer(message) {
 	const live = indexerWorkers.filter((w) => !w.dead && w.process);
 	if (live.length === 0) {
 		return Promise.reject(new Error("Indexer not running"));
 	}
-	const worker = live[pickRoundRobin++ % live.length];
+	const minimum = Math.min(...live.map((w) => w.pending.size));
+	const available = live.filter((w) => w.pending.size === minimum);
+	const worker = available[pickRoundRobin++ % available.length];
 	return new Promise((resolve, reject) => {
 		const id = `r${++requestId}`;
 		const timer = setTimeout(() => {
@@ -2745,6 +3133,7 @@ function modelsManifest() {
 // Recursively collect every supported media file under `dir`. Symlinked
 // directories are skipped to avoid cycles; unreadable entries are ignored.
 async function scanDirForMedia(dir, out = []) {
+	if (require("./main-lib/photos-path-policy").isPhotosInternal(dir)) return out;
 	let entries;
 	try {
 		entries = await fs.promises.readdir(dir, { withFileTypes: true });
@@ -2753,6 +3142,7 @@ async function scanDirForMedia(dir, out = []) {
 	}
 	for (const entry of entries) {
 		const full = path.join(dir, entry.name);
+		if (require("./main-lib/photos-path-policy").isPhotosInternal(full)) continue;
 		if (entry.isDirectory()) {
 			// Never recurse into symlinked directories (cycle risk); real
 			// subdirectories are scanned recursively.
@@ -2787,6 +3177,7 @@ async function scanDirForMedia(dir, out = []) {
 async function expandMediaPaths(paths) {
 	const out = [];
 	for (const p of paths) {
+		if (require("./main-lib/photos-path-policy").isPhotosInternal(p)) continue;
 		let stat;
 		try {
 			stat = await fs.promises.stat(p);
@@ -3016,6 +3407,10 @@ async function importPaths(rawPaths, { fromWatch = false, managedCopy = false } 
 	} finally {
 		await flushFailedImports().catch(error => console.warn(`[memories] failed-imports flush: ${error.message}`));
 		importInFlight = false;
+		activeImportProcesses = null;
+		pendingResourceEstimate = null;
+		indexerPoolTarget = INDEXER_POOL_SIZE;
+		trimIndexerPool();
 		importControl.finish();
 		importSearch = null;
 		updateTrayState();
@@ -3036,11 +3431,14 @@ async function importPaths(rawPaths, { fromWatch = false, managedCopy = false } 
 }
 
 async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = false } = {}) {
-	spawnIndexer();
+	const performanceSettings = readSettings();
+	const configuredConcurrency = importPerformance(performanceSettings, resourceSummary()).effective;
+	// Scan and deduplicate before paying to load extra model processes.
+	// Empty watch polls must not repeatedly launch and retire the whole pool.
 	// Any path may be a directory (folder picker / folder drop): expand it to
 	// the media files inside so the batch counter below counts real files.
 	importControl.update({ phase: "scanning", filename: "", done: 0, total: 0 });
-	const paths = await expandMediaPaths(rawPaths);
+	const paths = await require("./main-lib/photos-trash-state").filterPaths(await expandMediaPaths(rawPaths));
 
 	// Auto-watch folders: any DIRECTORY in the batch joins the persisted
 	// watch list (the expand above already flattened it to files — rawPaths
@@ -3120,6 +3518,29 @@ async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = fal
 		});
 	}
 	uniquePaths = sortPathsByMtime(uniquePaths, filePath => sourceStats.get(filePath));
+
+	let knownSourceBytes = 0, assessedSources = 0;
+	for (const file of uniquePaths) {
+		if (++assessedSources % 512 === 0) await new Promise(resolve => setImmediate(resolve));
+		const size = sourceStats.get(file)?.size;
+		if (!Number.isSafeInteger(size) || size < 0) { knownSourceBytes = null; break; }
+		knownSourceBytes += size;
+	}
+	pendingResourceEstimate = { count: uniquePaths.length, sourceBytes: knownSourceBytes };
+	const assessedConcurrency = importPerformance(performanceSettings, { ...resourceSummary(), count: l.filenames.length + uniquePaths.length }).effective;
+	const concurrency = Math.max(1, Math.min(configuredConcurrency, assessedConcurrency, uniquePaths.length));
+	activeImportProcesses = uniquePaths.length ? concurrency : 0;
+	if (uniquePaths.length > 0) {
+		while (resourceGate.reason(256 * 1024 * 1024)) {
+			importControl.update({ phase: "waiting", waitingReason: resourceGate.reason(256 * 1024 * 1024) });
+			if (isQuitting) throw Error("应用正在退出，添加任务保留");
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
+		indexerPoolTarget = concurrency;
+		trimIndexerPool();
+		spawnIndexer();
+		await growPool();
+	}
 
 	// Video posters are generated off the import critical path (see below);
 	// all jobs must settle before the library-updated broadcast so the
@@ -3243,7 +3664,7 @@ async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = fal
 		}
 	};
 
-	const importPacer = require("./main-lib/import-pacer.js").createImportPacer(fromWatch);
+	const importPacer = require("./main-lib/import-pacer.js").createImportPacer(true);
 
 	// Process one file: validate, copy, then embed through the worker pool.
 	// Always returns an outcome object (never throws) so the ordered flush
@@ -3397,23 +3818,32 @@ async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = fal
 		}
 	};
 
-	// Bounded-concurrency pump: keep a couple of files in flight per worker
+	// Bounded-concurrency pump: one file per configured worker
 	// so a slow video on one worker doesn't idle the others; each worker
 	// serializes its own requests (see indexer.js). The batch completes when
 	// every path has been dispatched AND every in-flight task has settled
 	// (its outcome flushed) — a plain Promise.all over the first wave would
 	// miss tasks launched later by pump().
-	const BATCH_CONCURRENCY = Math.max(2, INDEXER_POOL_SIZE * 2);
-	const concurrency = fromWatch ? 2 : BATCH_CONCURRENCY;
 	const inflight = new Set();
 	let resolveBatch = null;
 	const batchDone = new Promise((r) => {
 		resolveBatch = r;
 	});
+	let resourceRetry = null;
 	const pump = () => {
+		clearTimeout(resourceRetry);
 		// Bound completed-but-unflushed results too: a slow first video
 		// must not accumulate an entire batch behind it.
 		while (!importControl.paused() && inflight.size < concurrency && inflight.size + pendingResults.size < concurrency * 2 && next < total) {
+			const sourceBytes = managedCopy ? sourceStats.get(uniquePaths[next])?.size : 0;
+			const budget = Math.ceil((sourceBytes || 0) + 256 * 1024 * 1024);
+			const release = resourceGate.acquire(budget);
+			if (!release) {
+				importControl.update({ phase: "waiting", waitingReason: resourceGate.reason(budget) });
+				resourceRetry = setTimeout(pump, 1000);
+				return;
+			}
+			importControl.update({ waitingReason: "" });
 			const seq = next++;
 			const task = processOne(seq).then(
 				(outcome) => {
@@ -3436,6 +3866,7 @@ async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = fal
 			);
 			inflight.add(task);
 			void task.finally(() => {
+				release();
 				inflight.delete(task);
                 sendImport("embedding", "");
                 if (importControl.paused() && inflight.size === 0) {
@@ -3459,7 +3890,7 @@ async function importPathsInner(rawPaths, { fromWatch = false, managedCopy = fal
 	pump();
 	// Empty batch: nothing was dispatched, so nothing will ever resolve it.
 	if (total === 0) resolveBatch();
-	try { await batchDone; } finally { importPacer.close(); }
+	try { await batchDone; } finally { clearTimeout(resourceRetry); importPacer.close(); }
 	importControl.onResume(null);
 
 	for (const p of skippedPaths) {
@@ -3585,14 +4016,14 @@ const WATCH_POLL_INTERVAL_MS = 60_000;
 // migration owns the pipeline, importPaths would refuse, so retry shortly
 // instead of dropping the change. Resolves when the (possibly empty) sync
 // import settles.
-async function syncWatchedFolder(folder) {
+async function syncWatchedFolder(folder, changedPaths = null) {
 	// A scheduled retry can outlive the watch itself (the user removed the
 	// folder while an import was busy). Never sync — or worse, re-arm and
 	// importPaths (which auto-watches folders in the batch) would resurrect
 	// the folder the user just unwatched.
 	if (!watchedFolders.includes(folder)) return Promise.resolve();
 	if (importInFlight || migrationState || driveTransfer) {
-		setTimeout(() => syncWatchedFolder(folder), 5000);
+		setTimeout(() => syncWatchedFolder(folder, changedPaths), 5000);
 		return Promise.resolve();
 	}
 	let stat;
@@ -3607,7 +4038,8 @@ async function syncWatchedFolder(folder) {
 	if (!folderWatchers.has(folder) && !watchFailedFolders.has(folder)) {
 		watchFolder(folder);
 	}
-	return importPaths([folder], { fromWatch: true }).catch((err) => {
+	const targets = await require("./main-lib/watch-change-batch.js").resolveChanges(folder, changedPaths, fs.promises.stat);
+	return importPaths(targets, { fromWatch: true }).catch((err) => {
 		console.warn(
 			`[memories] watched-folder sync failed for ${folder}: ${err.message}`,
 		);
@@ -3627,13 +4059,15 @@ async function syncWatchedFolders() {
 // the poll covers whatever the platform watch can't see.
 function watchFolder(folder) {
 	if (folderWatchers.has(folder)) return;
-	const onChange = () => {
+	const changes = require("./main-lib/watch-change-batch.js").createChangeBatch(folder);
+	const onChange = (_event, filename) => {
+		changes.add(filename);
 		clearTimeout(watchDebounceTimers.get(folder));
 		watchDebounceTimers.set(
 			folder,
 			setTimeout(() => {
 				watchDebounceTimers.delete(folder);
-				syncWatchedFolder(folder);
+				syncWatchedFolder(folder, changes.drain());
 			}, WATCH_DEBOUNCE_MS),
 		);
 	};
@@ -3916,6 +4350,7 @@ function scheduleEnrichment() {
 
 function enrichAllowed() {
 	return (
+		!resourceGate.reason(512 * 1024 * 1024) &&
 		!backgroundPaused &&
 		!enrichInFlight &&
 		!importInFlight &&
@@ -3934,6 +4369,9 @@ async function pumpEnrichment() {
 		if (enrichQueue.length > 0 && !backgroundPaused) scheduleEnrichment();
 		return;
 	}
+	const releaseResource = resourceGate.acquire(512 * 1024 * 1024);
+	if (!releaseResource) { scheduleEnrichment(); return; }
+	try {
 	const job = enrichQueue[0];
 	// Row deleted while queued — drop without work, retry, or tray noise.
 	if (job && !libraryHasRow(job.filename)) {
@@ -4204,6 +4642,8 @@ async function pumpEnrichment() {
 		);
 	}
 	scheduleEnrichment();
+
+	} finally { releaseResource(); }
 }
 
 async function generatePoster(videoPath) {
@@ -4546,6 +4986,7 @@ function scheduleTranscription() {
 
 function transcribeAllowed() {
 	return (
+		!resourceGate.reason(512 * 1024 * 1024) &&
 		!backgroundPaused &&
 		!transcribeInFlight &&
 		!importInFlight &&
@@ -4674,6 +5115,9 @@ async function pumpTranscription() {
 			scheduleTranscription();
 		return;
 	}
+	const releaseResource = resourceGate.acquire(512 * 1024 * 1024);
+	if (!releaseResource) { scheduleTranscription(); return; }
+	try {
 	const job = transcribeQueue[0];
 	// Row deleted while queued — drop without work, retry, or tray noise.
 	if (job && !libraryHasRow(job.filename)) {
@@ -5013,6 +5457,8 @@ async function pumpTranscription() {
 		pending: transcribeQueue.length,
 	});
 	scheduleTranscription();
+
+	} finally { releaseResource(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -5333,6 +5779,7 @@ function scheduleOcr() {
 
 function ocrAllowed() {
 	return (
+		!resourceGate.reason(512 * 1024 * 1024) &&
 		!backgroundPaused &&
 		!ocrInFlight &&
 		!importInFlight &&
@@ -5422,6 +5869,9 @@ async function pumpOcr() {
 		if (ocrQueue.length > 0 && !backgroundPaused) scheduleOcr();
 		return;
 	}
+	const releaseResource = resourceGate.acquire(512 * 1024 * 1024);
+	if (!releaseResource) { scheduleOcr(); return; }
+	try {
 	const filename = ocrQueue[0];
 	// Row deleted while queued — drop without a tesseract run or a failed
 	// entry in the drain summary.
@@ -5589,6 +6039,8 @@ async function pumpOcr() {
 		return;
 	}
 	scheduleOcr();
+
+	} finally { releaseResource(); }
 }
 
 function killOcrWorker() {
@@ -5697,16 +6149,14 @@ async function resolveRenderer(p) {
 // released when the stream ends or errors.
 function openFileStreamRange(filePath, start, end) {
 	return fs.promises.open(filePath, "r").then((handle) => {
-		const nodeStream = fs.createReadStream(null, {
-			fd: handle.fd,
+		// Keep one owner for the descriptor. A cancelled raw-fd ReadStream
+		// closes its fd even with autoClose:false; closing the FileHandle
+		// afterwards can close an unrelated file that reused that number.
+		const nodeStream = handle.createReadStream({
 			start,
 			end,
-			autoClose: false,
+			autoClose: true,
 		});
-		const release = () => handle.close().catch(() => {});
-		nodeStream.on("error", release);
-		nodeStream.on("end", release);
-		nodeStream.on("close", release);
 		return Readable.toWeb(nodeStream);
 	});
 }
@@ -5725,8 +6175,16 @@ async function handleAppRequest(request) {
 	// Library files (served from memory so imports are atomic)
 	if (urlPath === "/memories-index.json") {
 		const idx = libraryIndex();
+		let hidden;
+		try {
+			hidden = await require("./main-lib/photos-trash-state").trashed(idx.images.map((filename,i)=>({filenameKey:filename,source:idx.sources[i]})), { strict: true });
+		} catch {
+			return respond(503, "照片删除状态暂时无法核验，请稍后重新加载。", "text/plain; charset=utf-8", { "Cache-Control": "no-store" });
+		}
+		idx.recentlyDeleted = [...hidden].filter(filename=>!assetLocks.has(filename));
+		idx.lockedRecentlyDeleted = [...hidden].filter(filename=>assetLocks.has(filename));
 		const l = loadLibrary();
-		const etag = `"idx-${l.filenames.length}-${l.dim}-${l.modelId}"`;
+		const etag = `"idx-${l.filenames.length}-${l.dim}-${l.modelId}-${idx.recentlyDeleted.length}-${idx.lockedRecentlyDeleted.length}"`;
 		if (request.headers.get("if-none-match") === etag) {
 			return respond(304, null, null);
 		}
@@ -6149,6 +6607,7 @@ function buildApplicationMenu() {
 			label: app.name,
 			submenu: [
 				{ role: "about" },
+                require("./main-lib/telemetry").menuItem(),
 				{ type: "separator" },
 				{ role: "hide" },
 				{ role: "hideOthers" },
@@ -6253,16 +6712,18 @@ async function drainManualImports() {
   }
  } finally { manualImportDraining = false; }
 }
-function enqueueManualImport(paths) {
+function enqueueManualImport(paths, { wait = true } = {}) {
  loadManualImports();
  if (!Array.isArray(paths) || paths.some(p => typeof p !== "string" || !path.isAbsolute(p))) throw Error("无效导入路径");
  const job = { id: require("node:crypto").randomUUID(), paths };
- manualImportJobs.push(job); saveManualImports();
- const result = new Promise((resolve, reject) => manualImportWaiters.set(job.id, { resolve, reject }));
- void drainManualImports();
+ manualImportJobs.push(job);
+ try { saveManualImports(); } catch (error) { manualImportJobs.pop(); throw error; }
+ const result = wait ? new Promise((resolve, reject) => manualImportWaiters.set(job.id, { resolve, reject }))
+  : { queued: true, jobId: job.id, selected: paths.length, pendingJobs: manualImportJobs.length, paused: manualImportPaused };
+ void drainManualImports().catch(error => console.warn("[import-queue]", error.message));
  return result;
 }
-async function pickAndImport() {
+async function pickAndImport({ wait = true } = {}) {
 	const win = BrowserWindow.getAllWindows()[0];
 	const result = await dialog.showOpenDialog(win, {
 		title: "Import Photos or Folder",
@@ -6301,7 +6762,7 @@ async function pickAndImport() {
 		],
 	});
 	if (result.canceled) return null;
-	return enqueueManualImport(result.filePaths);
+	return enqueueManualImport(result.filePaths, { wait });
 }
 
 // Renderer sandbox: contextIsolation + sandbox isolate the renderer from
@@ -6484,7 +6945,8 @@ function ensureRankWorker() {
 // reset or advance the worker's live cursor between acknowledged batches.
 let rankWorkQueue = Promise.resolve();
 function queueRankWork(work) {
- const result = rankWorkQueue.then(work);
+ const endQuery = resourceGate.queryStarted();
+ const result = rankWorkQueue.then(work).finally(endQuery);
  rankWorkQueue = result.catch(() => {});
  return result;
 }
@@ -6655,7 +7117,7 @@ async function rankSearchWithVec(queryText, topK, qVecOverride) {
 	return withVec(results || [], Array.from(qVec));
 }
 
-ipcMain.handle("memories:similar-photos", async (_event, filename) => {
+async function searchSimilarPhotos(filename) {
  try {
   if (migrationState) throw new Error("正在切换搜索模型，请完成后再查找相似照片。");
   if (typeof filename !== "string") throw new Error("无效的照片。");
@@ -6663,11 +7125,25 @@ ipcMain.handle("memories:similar-photos", async (_event, filename) => {
   const remaining = new Set(loadLibrary().filenames);
   return { ok: true, matches: matches.filter(item => remaining.has(item.filename)) };
  } catch (error) { return { ok: false, error: error.message }; }
-});
+}
 
-ipcMain.handle("memories:rank", async (_event, query, topK) => {
-	return rankSearchWithVec(query, topK || 96);
+const cachedSearch = require("./main-lib/search-result-cache.js").createCachedSearch({
+ context: async mode => {
+  const idle=()=>!isQuitting&&!migrationState&&!startupModelPending&&!importInFlight&&!driveTransfer&&!activeFileTaskID&&!enrichInFlight&&!transcribeInFlight&&!ocrInFlight;
+  if(!idle())return null;
+  const library=loadLibrary(),generation=libraryGenerationNumber();
+  const files=["memories-index.json",`memory-embeddings-${library.modelId}.bin`,`memory-phrase-embeddings-${library.modelId}.bin`,`memory-segments-${library.modelId}.json`,`memory-transcripts-${library.modelId}.json`,"category-overrides.json",...(mode==="detection"?["image-detections.sqlite","image-detections.sqlite-wal"]:[])];
+  const revisions=await Promise.all(files.map(async name=>{try{const stat=await fs.promises.stat(path.join(DATA_DIR,name),{bigint:true});return [name,String(stat.ino),String(stat.size),String(stat.mtimeNs),String(stat.ctimeNs)];}catch(error){if(error.code==='ENOENT')return [name,null];throw error;}}));
+  if(!idle()||generation!==libraryGenerationNumber())return null;
+  return {libraryId:DATA_DIR,libraryRevision:JSON.stringify([generation,library.filenames.length,library.ocrRevision||0,revisions]),modelVersion:library.modelId,searchVersion:"rank-cache-v1",mode,settings:require("node:crypto").createHash("sha256").update(JSON.stringify(readSettings())).digest("hex"),thresholds:thresholdsFor(library.modelId)||{}};
+ },
+ request: message=>queueRankWork(()=>askRankWorker(message)),
 });
+const cachedSimilar=cachedSearch("similar",searchSimilarPhotos);
+ipcMain.handle("memories:similar-photos", async (_event, filename) => cachedSimilar(filename));
+const cachedDetection=cachedSearch("detection",(kind,query)=>({ok:true,...getDetectionIndex().search(kind,query)}));
+const cachedRank=cachedSearch("visual",(query,topK)=>rankSearchWithVec(query,topK||96));
+ipcMain.handle("memories:rank", async (_event, query, topK) => { const result=await cachedRank(query,topK); if(String(query||"").trim())require("./main-lib/telemetry").track("Search.used",query); return result; });
 
 // ---------------------------------------------------------------------------
 // Moment ranking: Scenes (pure visual) and Dialogue (pure transcript) are
@@ -6832,9 +7308,11 @@ async function rankTranscriptMoments(queryText, topK) {
 	return exactDialogueSearch({ query: trimmed, docs, segVideos, topK: k });
 }
 
+const cachedScenes=cachedSearch("scenes",(query,topK)=>rankVisualScenes(query,topK||24));
+const cachedDialogue=cachedSearch("dialogue",(query,topK)=>rankTranscriptMoments(query,topK||24));
 ipcMain.handle("memories:rank-scenes", async (_event, query, topK) => {
 	try {
-		return await rankVisualScenes(query, topK || 24);
+		return await cachedScenes(query, topK);
 	} catch {
 		return [];
 	}
@@ -6842,7 +7320,7 @@ ipcMain.handle("memories:rank-scenes", async (_event, query, topK) => {
 
 ipcMain.handle("memories:rank-dialogue", async (_event, query, topK) => {
 	try {
-		return await rankTranscriptMoments(query, topK || 24);
+		return await cachedDialogue(query, topK);
 	} catch {
 		return [];
 	}
@@ -6894,6 +7372,13 @@ ipcMain.handle("memories:transcribe-state", () => transcribeSnapshot());
 
 ipcMain.handle("memories:ocr-state", () => ocrSnapshot());
 
+let queuedImportPicker = null;
+ipcMain.handle("memories:queue-import", async (_event, paths) => {
+ if (paths !== undefined) return enqueueManualImport(paths, { wait: false });
+ if (!queuedImportPicker) queuedImportPicker = pickAndImport({ wait: false }).finally(() => { queuedImportPicker = null; });
+ return queuedImportPicker;
+});
+
 ipcMain.handle("memories:import-paths", async (_event, paths) => {
 	const list = Array.isArray(paths)
 		? paths.filter((p) => typeof p === "string")
@@ -6901,13 +7386,62 @@ ipcMain.handle("memories:import-paths", async (_event, paths) => {
 	return enqueueManualImport(list);
 });
 
+async function getResourceStatus() {
+ await resourceGate.refresh();
+ const settings = readSettings();
+ const target = settings.storageTarget || null;
+ let targetState = null;
+ if (target) {
+  try { await adaptiveResources.validateTarget(target); targetState = { ...target, ...await adaptiveResources.probeSpace(target.directory), online: true }; }
+  catch (error) { targetState = { ...target, freeBytes: null, online: false, error: error.message }; }
+ }
+ return { version: 1, acknowledged: settings.resourceSetupVersion === 1,
+  performance: getImportPerformance(), pending: pendingResourceEstimate, plan: adaptiveResources.resourcePlan({ ...resourceSummary(), freeBytes: resourceGate.snapshot().freeBytes, sourceBytes: pendingResourceEstimate?.sourceBytes ?? null }),
+  gate: resourceGate.snapshot(), target: targetState };
+}
+ipcMain.handle("memories:resource-status", getResourceStatus);
+ipcMain.handle("memories:resource-mode", async (_event, mode) => {
+ if (!["auto", "economy", "manual"].includes(mode)) throw Error("无效处理方案");
+ writeSettings({ resourceMode: mode });
+ if (readSettings().resourceMode !== mode) throw Error("方案未能保存，请检查磁盘空间。");
+ return getResourceStatus();
+});
+ipcMain.handle("memories:resource-acknowledge", () => {
+ writeSettings({ resourceSetupVersion: 1, resourceAssessment: { version: 1, assessedAt: new Date().toISOString(), ...resourceSummary(), cores: getImportPerformance().cores, memoryGiB: getImportPerformance().memoryGiB } });
+ if (readSettings().resourceSetupVersion !== 1) throw Error("设置未能保存。");
+ return true;
+});
+ipcMain.handle("memories:storage-target", async () => {
+ const picked = await dialog.showOpenDialog({ title: "选择备份或传输的存储文件夹", defaultPath: readSettings().storageTarget?.directory, properties: ["openDirectory", "createDirectory"] });
+ if (picked.canceled) return getResourceStatus();
+ const target = await adaptiveResources.volumeIdentity(picked.filePaths[0]);
+ const managed = await fs.promises.realpath(app.getPath("userData"));
+ if (target.directory === managed || target.directory.startsWith(managed + path.sep)) throw Error("请选择应用资料库以外的文件夹。");
+ await adaptiveResources.testWritableTarget(target);
+ const space = await adaptiveResources.probeSpace(target.directory);
+ if (space.freeBytes == null || space.freeBytes < 2 * adaptiveResources.GiB) throw Error("目标空间不足或不可读取，请选择其他磁盘。");
+ writeSettings({ storageTarget: target });
+ if (readSettings().storageTarget?.uuid !== target.uuid || readSettings().storageTarget?.directory !== target.directory) throw Error("目标未能保存。");
+ return getResourceStatus();
+});
+
+function getImportPerformance() {
+	return { ...importPerformance(readSettings(), resourceSummary()), active: activeImportProcesses };
+}
+ipcMain.handle("memories:import-performance", () => getImportPerformance());
+ipcMain.handle("memories:set-import-processes", (_event, value) => {
+	const importProcesses = validateProcesses(value);
+	writeSettings({ importProcesses, resourceMode: "manual" });
+	return getImportPerformance();
+});
+
 ipcMain.handle("memories:import-state", () => {
  loadManualImports();
  const state = importControl.snapshot();
- return !state.active && manualImportJobs.length ? { ...state, active: true, paused: manualImportPaused, phase: "waiting", total: manualImportJobs.length, done: 0 } : state;
+ return { ...(!state.active && manualImportJobs.length ? { ...state, active: true, paused: manualImportPaused, phase: "waiting", total: manualImportJobs.length, done: 0 } : state), pendingJobs: manualImportJobs.length, waitingReason: state.waitingReason || (manualImportPaused ? "添加队列已暂停" : driveTransfer ? "等待文件传输或删除完成" : migrationState || startupModelPending ? "等待搜索模型就绪" : "等待开始添加") };
 });
 ipcMain.handle("memories:import-pause", (_event, paused) => {
- if (paused === false && driveTransfer) throw new Error("请等待副本清理或文件传输结束后再继续导入。");
+ // Resuming the queue is safe: drainManualImports retains the transfer guard.
  loadManualImports();
  manualImportPaused = paused; saveManualImports();
  const state = importControl.setPaused(paused);
@@ -7105,7 +7639,7 @@ function removeLibraryRow(filename) {
 	return true;
 }
 
-async function performDelete(filename, options, journal, save) {
+async function performDelete(filename, options, journal, save, { deferIndexSave = false } = {}) {
 	if (assetLocks.has(filename)) return {ok:false,error:FILE_LOCK_ERROR};
 	if (filesLocked()) return {ok:false,error:FILE_LOCK_ERROR};
 	if (driveTransfer) return { ok: false, error: "正在传输或删除文件，请稍后重试。" };
@@ -7138,27 +7672,17 @@ async function performDelete(filename, options, journal, save) {
   journal.sizes={original:sourceStat?.isFile()?sourceStat.size:null};save();
  }
  if(journal&&!journal.validated){journal.validated=true;save();}
- await persistMovedSource(original);
  let originalTrashed = false;
  if (options?.original === true) {
   try { await fs.promises.lstat(original); }
   catch (error) { if (error.code !== "ENOENT") throw error; }
   try {
    // Route Photos assets through PhotoKit; ordinary files use the stored importer path.
-   const photos = await photosOriginal(original);
+   const photos = journal?.photos?.requested ? journal.photos : await photosOriginal(original);
    if (photos) {
     if(!journal) throw Error("照片删除缺少持久任务记录");
     const result=await getPhotoDeletion().remove(original,journal.originalSignature,journal,save,driveTransfer.signal,undefined,{beforeDelete:async request=>{
-     assertPhotoAssetUnlocked(original);
-     if(options.duplicateKeeper){
-      const keeperIndex=library.filenames.indexOf(options.duplicateKeeper);
-      const keeper=keeperIndex>=0?library.sources[keeperIndex]:null;
-      if(!keeper || photoAssetKey(keeper)===photoAssetKey(original))throw Error("不能删除保留原图所属的同一照片项目");
-      if(request.resources.length===1)return;
-      const other=await getPhotoDeletion().inspect(keeper,driveTransfer.signal);
-      const fingerprints=resources=>JSON.stringify(resources.map(r=>`${r.type}:${r.size}:${r.hash}`).sort());
-      if(fingerprints(request.resources)!==fingerprints(other.resources))throw Error("配套资源不同，不能作为重复照片删除；可单独选择原件删除");
-     }
+     await verifyDeletePhotoAsset(original,options,request,driveTransfer.signal);
     }});
     journal.sizes.original=result.size;journal.deletedResourceCount=result.count;
    } else {
@@ -7174,16 +7698,17 @@ async function performDelete(filename, options, journal, save) {
    if (!originalTrashed) return { ok: false, error: "无法将原文件移到废纸篓，素材库仍保留。请检查文件权限或网盘状态。" };
   }
  }
+ await persistMovedSource(original);
  try { await fs.promises.unlink(path.join(PHOTOS_DIR, filename)); }
- catch (error) { if (error.code !== "ENOENT") return { ok: false, error: originalTrashed ? "原文件已移到废纸篓，但文件引用清理失败，请重试。" : "文件引用移除失败。" }; }
+ catch (error) { if (error.code !== "ENOENT") return { ok: false, error: originalTrashed ? (journal?.photos?.requested ? "Apple照片已进入最近删除，但文件引用清理失败，请重试。" : "原文件已移到废纸篓，但文件引用清理失败，请重试。") : "文件引用移除失败。" }; }
 	if (!removeLibraryRow(filename)) return { ok: false };
  if(journal?.photos?.requested && originalTrashed)await forgetPhotoAsset(original);
-	await saveLibrary();
+	if (!deferIndexSave) await saveLibrary({strict:true});
 	// Stop the pumps working on the deleted row (queued jobs, tray
 	// progress) and push fresh tray snapshots — otherwise the pills keep
 	// showing a file that no longer exists.
 	dropQueuedJobsFor(filename);
-	for (const win of BrowserWindow.getAllWindows()) {
+	if (!deferIndexSave) for (const win of BrowserWindow.getAllWindows()) {
 		win.webContents.send("memories:status", { type: "library-updated" });
 	}
 	broadcastEnrichEvent(enrichSnapshot());
@@ -7193,43 +7718,162 @@ async function performDelete(filename, options, journal, save) {
  } finally { driveTransfer = null; }
 }
 
+async function verifyDeletePhotoAsset(original, options, request, signal) {
+ const library=loadLibrary();
+     assertPhotoAssetUnlocked(original);
+     if(options.duplicateKeeper){
+      const keeperIndex=library.filenames.indexOf(options.duplicateKeeper);
+      const keeper=keeperIndex>=0?library.sources[keeperIndex]:null;
+      if(!keeper || photoAssetKey(keeper)===photoAssetKey(original))throw Error("不能删除保留原图所属的同一照片项目");
+      if(request.resources.length===1)return;
+      const other=await getPhotoDeletion().inspect(keeper,signal);
+      const fingerprints=resources=>JSON.stringify(resources.map(r=>`${r.type}:${r.size}:${r.hash}`).sort());
+      if(fingerprints(request.resources)!==fingerprints(other.resources))throw Error("配套资源不同，不能作为重复照片删除；可单独选择原件删除");
+     }
+}
+
 async function createDeleteTask(entries) {
  if(filesLocked())throw Error(FILE_LOCK_ERROR);
  if(!Array.isArray(entries)||!entries.length||entries.some(e=>typeof e?.filename!=="string"||path.basename(e.filename)!==e.filename))throw Error("无效删除任务");
  const rows=await captureTaskRows([...new Set(entries.map(e=>e.filename))]);
  for(const row of rows){if(assetLocks.has(row.filename))throw Error(FILE_LOCK_ERROR);const request=entries.find(e=>e.filename===row.filename);row.options={original:request.original===true,...(typeof request.duplicateKeeper==='string'?{duplicateKeeper:request.duplicateKeeper}:{})};}
- return getFileTasks().add("delete",{rows,photosDeleteVersion:1},rows.length).promise;
+ const keepers=entries.map(e=>e.duplicateKeeper).filter(name=>typeof name==='string');
+ const protectedRows=keepers.length?await captureTaskRows([...new Set(keepers)]):[];
+ return getFileTasks().add("delete",{rows,protectedRows,photosDeleteVersion:1},rows.length).promise;
 }
 ipcMain.handle("memories:delete-batch", (_event,entries)=>driveReply(()=>createDeleteTask(entries)));
 ipcMain.handle("memories:delete", (_event,filename,options)=>driveReply(async()=>{const result=await createDeleteTask([{...options,filename}]);return result.results[0]||{ok:false};}));
+async function prepareDeleteChecks(job, save, stopped, start) {
+ const controller=new AbortController();
+ driveTransfer=controller;
+ job.deleteChecks ||= {};
+ // Apply saved changes between waves without interrupting in-flight checks.
+ const configured=readSettings().deleteVerificationConcurrency;
+ job.verificationConcurrency=Number.isInteger(configured)&&configured>=1&&configured<=100?configured:10;
+ job.activeVerifications=0;
+ try {
+  const rows=job.payload.rows.slice(start,start+job.verificationConcurrency);
+  const results=await Promise.allSettled(rows.map(async(row,offset)=>{
+   const index=start+offset;
+   controller.signal.throwIfAborted();if(stopped())throw Error("删除已暂停");
+   const journal=job.current?.filename===row.filename?job.current:(job.deleteChecks[index] ||= {filename:row.filename,originalSignature:row.originalSignature});
+   // Requested commits are recovered by the serial deletion path, never by preparation.
+   if(journal.photos?.requested || journal.skipReason)return;
+   job.activeVerifications++;
+   try {
+    if(!await assertTaskRow(row,true))return;
+    if(!row.options.original)return;
+    const stat=await fs.promises.lstat(row.source).catch(error=>{if(error.code!=="ENOENT")throw error;return null;});
+    if(stat&&(!stat.isFile()||taskSignature(stat)!==row.originalSignature))throw Error("原文件已变化，未继续删除");
+    if(!stat)return;
+    if(row.options.duplicateKeeper)await require("./main-lib/duplicate-cleanup.js").verifyDuplicate({library:loadLibrary(),filename:row.filename,keeper:row.options.duplicateKeeper,isLocked:name=>assetLocks.has(name)});
+    const photos=await photosOriginal(row.source);
+    if(photos)await getPhotoDeletion().remove(row.source,row.originalSignature,journal,save,controller.signal,undefined,{prepareOnly:true,beforeDelete:request=>verifyDeletePhotoAsset(row.source,row.options,request,controller.signal)});
+    controller.signal.throwIfAborted();if(stopped())throw Error("删除已暂停");
+   } catch(error) {
+    // Keep every resource of a burst. Never skip an uncertain/committed deletion.
+    if(error.message!=="连拍组尚未完整核对备份，未删除" || journal.photos?.requested)throw error;
+    journal.skipReason="连拍素材已保留";
+    delete journal.photosPrepared;
+    save();
+   } finally {job.activeVerifications--;}
+  }));
+  const failure=results.find(result=>result.status==='rejected');
+  if(failure)throw failure.reason;
+  job.checkedCount=start+rows.length;
+  return start+rows.length;
+ } finally {job.activeVerifications=0;driveTransfer=null;save();}
+}
+
+async function commitDeleteSelection(job,save,stopped) {
+ if(job.selectionDeleteBatch?.confirmed)return;
+ const controller=new AbortController();
+ try {
+  if(!job.selectionDeleteBatch){
+   for(let start=job.done;start<job.payload.rows.length;){
+    if(stopped())throw Error("删除已暂停");
+    start=await prepareDeleteChecks(job,save,stopped,start);
+   }
+   job.selectionDeleteBatch={allowEmpty:true,entries:Object.entries(job.deleteChecks).filter(([index,journal])=>Number(index)>=job.done&&!journal.skipReason&&journal.photosPrepared&&!journal.photos?.requested).map(([index,journal])=>({index:Number(index),journal}))};save();
+  }
+  driveTransfer=controller;
+  // JSON persistence duplicates nested journals: reconnect before receipt recovery.
+  for(const entry of job.selectionDeleteBatch.entries)entry.journal=job.deleteChecks[entry.index] ||= entry.journal;
+  await getPhotoDeletion().commitBatch(job.selectionDeleteBatch,save,controller.signal,async()=>{
+   const guards=[];
+   for(const entry of job.selectionDeleteBatch.entries){
+    if(stopped())throw Error("删除已暂停");
+    const row=job.payload.rows[entry.index];
+    if(!await assertTaskRow(row,true))throw Error("选中素材已变化，未提交批量删除");
+    const stat=await fs.promises.lstat(row.source);
+    if(!stat.isFile()||taskSignature(stat)!==row.originalSignature)throw Error("原文件已变化，未提交批量删除");
+    if(row.options.duplicateKeeper)await require("./main-lib/duplicate-cleanup.js").verifyDuplicate({library:loadLibrary(),filename:row.filename,keeper:row.options.duplicateKeeper,isLocked:name=>assetLocks.has(name)});
+    await verifyDeletePhotoAsset(row.source,row.options,entry.journal.photosPrepared,controller.signal);
+    const exact=await fs.promises.lstat(row.source,{bigint:true});
+    guards.push({path:row.source,dev:String(exact.dev),ino:String(exact.ino),size:String(exact.size),mtimeNs:String(exact.mtimeNs),ctimeNs:String(exact.ctimeNs),hash:entry.journal.photosPrepared.hash});
+   }
+   return guards;
+  });
+ }finally{driveTransfer=null;}
+}
+
 async function runDeleteTask(job,save,stopped){
  activeFileTaskID=job.id;
+ let cursor=job.done,checkedUntil=job.done,dirty=false,checkpointFailed=false;
+ job.deleteChecks ||= {};
+ // Journals remain in deleteChecks until the index is durable. A crash can
+ // replay cleanup from job.done without reissuing a confirmed deletion.
+ const flush=async()=>{
+  if(!dirty && cursor===job.done)return;
+  try {await saveLibrary({strict:true});}catch(error){checkpointFailed=true;throw error;}
+  while(job.done<cursor){
+   const row=job.payload.rows[job.done],journal=job.deleteChecks[job.done];
+   job.space ||= {};
+   for(const [key,value] of Object.entries(journal?.space||{}))job.space[key]=(job.space[key]||0)+value;
+   job.results.push(journal?.skipReason ? {filename:row.filename,ok:false,skipped:true,error:journal.skipReason} : {filename:row.filename,ok:true});delete job.deleteChecks[job.done];job.done++;
+  }
+  job.current=job.deleteChecks[job.done]||null;
+  job.updatedAt=new Date().toISOString();save();dirty=false;
+  for(const win of BrowserWindow.getAllWindows())if(!win.isDestroyed())win.webContents.send("memories:status",{type:"library-updated"});
+ };
  try{
-  while(job.done<job.payload.rows.length&&!stopped()){
-   const row=job.payload.rows[job.done];
-   if(!job.current){job.current={filename:row.filename,originalSignature:row.originalSignature};save();}
-   if(job.current.photos?.requested){
+  if(job.current?.filename===job.payload.rows[job.done]?.filename)job.deleteChecks[job.done]=job.current;
+  await require("./main-lib/stable-task-identity").resume(job,save);
+  await commitDeleteSelection(job,save,stopped);
+  checkedUntil=job.payload.rows.length;
+  while(cursor<job.payload.rows.length&&!stopped()){
+   if(cursor>=checkedUntil && !job.deleteChecks[cursor]?.photos?.requested)checkedUntil=await prepareDeleteChecks(job,save,stopped,cursor);
+   if(stopped())break;
+   const row=job.payload.rows[cursor];
+   job.current=job.deleteChecks[cursor] ||= {filename:row.filename,originalSignature:row.originalSignature};save();
+   if(job.current.skipReason && !job.current.photos?.requested){cursor++;if(cursor-job.done>=25)await flush();continue;}
+   if(job.current.photos?.requested&&!job.current.trashed){
     const result=await getPhotoDeletion().remove(row.source,row.originalSignature,job.current,save);
     job.current.trashed=true;job.current.space={trashedCount:result.count,trashedBytes:result.size};save();
    }
-   const photosDeletionConfirmed=!!(job.current.photos?.requested && job.current.trashed);
-   const present=await assertTaskRow(row,true,photosDeletionConfirmed);
-   if(!present && photosDeletionConfirmed){await forgetPhotoAsset(row.source);await saveLibrary();}
+   const confirmed=!!(job.current.photos?.requested && job.current.trashed);
+   const present=await assertTaskRow(row,true,confirmed);
+   if(!present && confirmed){dirty=true;await forgetPhotoAsset(row.source);}
    if(present){
-    if(row.options.original&&row.source&&!photosDeletionConfirmed){
+    if(row.options.original&&row.source&&!confirmed){
      const stat=await fs.promises.lstat(row.source).catch(e=>{if(e.code!=="ENOENT")throw e;return null;});
      if(stat&&(!row.originalSignature||taskSignature(stat)!==row.originalSignature))throw Error("原文件已变化，未继续删除");
     }
     if(stopped())break;
-    const result=await performDelete(row.filename,row.options,job.current,save);
+    dirty=true;
+    const result=await performDelete(row.filename,row.options,job.current,save,{deferIndexSave:true});
     if(!result.ok)throw Error(result.error||"删除未完成");
    }
-   job.space ||= {};
-   for(const [key,value] of Object.entries(job.current.space||{}))job.space[key]=(job.space[key]||0)+value;
-   job.updatedAt=new Date().toISOString();
-   job.results.push({filename:row.filename,ok:true});job.done++;job.current=null;save();
+   cursor++;
+   if(cursor-job.done>=25)await flush();
   }
+  await flush();
   return {results:job.results,canceled:stopped()};
+ }catch(error){
+  // Pause/error commits the completed prefix only; a failing checkpoint leaves
+  // job.done and every per-item receipt available for the next recovery attempt.
+  if(!checkpointFailed && (dirty || cursor>job.done))await flush();
+  throw error;
  }finally{activeFileTaskID=null;}
 }
 
@@ -10919,7 +11563,8 @@ if (!gotTheLock) {
 			runWillQuitCleanup();
 			void (async () => {
 				try {
-					await Promise.all([drainPersistQueue(10000), flushFailedImports(), faceGroups.shutdown()]);
+					await fileTaskStore?.settle();
+                    await Promise.all([drainPersistQueue(10000), flushFailedImports(), faceGroups.shutdown()]);
 				} catch {
 					/* quit with what's flushed */
 				}
@@ -11010,3 +11655,16 @@ if (!gotTheLock) {
 		app.quit();
 	});
 }
+
+// Share the same ranking route with the independent menu-bar companion.
+app.whenReady().then(() => {
+ require("./main-lib/menu-search-service").startMenuSearchService({
+  directory: path.join(app.getPath("appData"), "SayPhoto Menu"),
+  search: (query, topK) => rankSearchWithVec(query, topK), library: loadLibrary,
+  openQuery: query => require("./main-lib/menu-open-query").openMenuQuery(query,{show:showAndFocusMain,window:liveMainWindow}),
+  onClose: close => app.once("will-quit", close),
+ });
+});
+
+app.whenReady().then(()=>require("./main-lib/telemetry").start(app));
+ipcMain.on("memories:usage-settings",()=>require("./main-lib/telemetry").track("Settings.opened"));

@@ -1,3 +1,4 @@
+try { require("node:os").setPriority(0, 10); } catch {}
 "use strict";
 
 // CLIP indexer worker. Runs under Electron's utilityProcess (plain Node —
@@ -291,7 +292,15 @@ async function loadModels() {
 		console.log("[indexer] loading CLIP image pipeline…");
 		const RawImage = mod.RawImage;
 		const eps = executionProviders();
-		const session_options = { executionProviders: eps };
+		// Extra import processes each use one inference thread instead of ten
+		// independent ONNX pools each attempting to occupy every CPU core.
+		const inferenceThreads = Number(process.env.INDEXER_INFERENCE_THREADS);
+		const session_options = {
+			executionProviders: eps,
+			...(Number.isInteger(inferenceThreads) && inferenceThreads > 0
+				? { intraOpNumThreads: inferenceThreads, interOpNumThreads: 1 }
+				: {}),
+		};
 		console.log(`[indexer] EP ${eps.join(",")}`);
 		const extractor = await mod.pipeline("image-feature-extraction", MODEL_ID, {
 			// transformers.js v3 replaced the v2 `quantized` flag with `dtype`

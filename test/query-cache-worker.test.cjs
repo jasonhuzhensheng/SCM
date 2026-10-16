@@ -1,0 +1,11 @@
+'use strict';
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),assert=require('node:assert/strict'),{fork}=require('node:child_process');
+(async()=>{const root=fs.mkdtempSync(path.join(os.tmpdir(),'query-cache-worker-'));let child;try{
+ const entry=path.join(root,'runner.cjs');fs.writeFileSync(entry,`process.parentPort={on:(_name,fn)=>process.on('message',data=>fn({data})),postMessage:message=>process.send(message)};require(${JSON.stringify(require.resolve('../main-lib/rank-worker'))});`);
+ async function start(){child=fork(entry,[],{env:{...process.env,SCM_USER_DATA_DIR:root},stdio:['ignore','ignore','inherit','ipc']});await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('worker startup timeout')),10000);child.once('error',reject);child.once('message',()=>{clearTimeout(timer);resolve()});});}
+ let id=0;const request=msg=>new Promise((resolve,reject)=>{const expected=String(++id);const timer=setTimeout(()=>{child.off('message',receive);reject(Error('worker response timeout'))},10000);function receive(value){if(value.id!==expected)return;clearTimeout(timer);child.off('message',receive);value.ok?resolve(value.results):reject(Error(value.error));}child.on('message',receive);child.send({...msg,id:expected});});
+ const stop=()=>new Promise(resolve=>{child.once('exit',resolve);child.send({type:'shutdown'});});
+ const context={libraryId:'fixture',libraryRevision:'1',modelVersion:'test',searchVersion:'1',mode:'visual'};
+ await start();assert.equal((await request({type:'query-cache-lookup',query:'beach',context})).hit,false);await request({type:'query-cache-store',query:'beach',context,result:[{filename:'a.jpg'}]});await stop();await start();assert.equal((await request({type:'query-cache-lookup',query:'beach',context})).result[0].filename,'a.jpg');assert.equal((await request({type:'query-cache-lookup',query:'beach',context:{...context,libraryRevision:'2'}})).hit,false);await stop();child=null;
+ console.log('PASS: actual rank-worker process SQLite protocol, restart persistence and revision invalidation without model loading');
+}finally{child?.kill();fs.rmSync(root,{recursive:true,force:true});}})().catch(e=>{console.error(e);process.exitCode=1});

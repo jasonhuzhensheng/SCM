@@ -5,7 +5,8 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const { once } = require('node:events');
 const API = 'https://www.googleapis.com/drive/v3';
-const SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const METADATA_SCOPE = 'https://www.googleapis.com/auth/drive.metadata.readonly';
+const SCOPE = 'https://www.googleapis.com/auth/drive.file '+METADATA_SCOPE;
 
 async function digest(file, signal) {
  const hash=crypto.createHash('md5');
@@ -32,7 +33,7 @@ function createGoogleDrive({userDataDir,safeStorage,openExternal,fetchImpl=fetch
   await fs.promises.writeFile(tmp,safeStorage.encryptString(JSON.stringify(next)),{mode:0o600});
   await fs.promises.rename(tmp,file); state=next;
  }
- function status(){const s=read();return {configured:!!s.client,connected:!!s.refresh_token};}
+ function status(){const s=read();return {configured:!!s.client,connected:!!s.refresh_token,metadataConnected:!!s.refresh_token&&(s.scope||'').split(' ').includes(METADATA_SCOPE)};}
  async function configure(json){if(loginPending)throw new Error('请先完成当前登录。');await save({client:validateClient(json)});return status();}
  async function tokenRequest(params){
   const r=await fetchImpl('https://oauth2.googleapis.com/token',{method:'POST',body:new URLSearchParams(params),signal:AbortSignal.timeout(30000)});
@@ -131,6 +132,31 @@ function createGoogleDrive({userDataDir,safeStorage,openExternal,fetchImpl=fetch
   if(await digest(file,signal)!==md5)throw new Error('本地文件已改变，已上传但保留本地副本。');
   return verified;
  }
- return {status,configure,login,disconnect,createFolder,upload};
+ async function metadata(id,signal){
+  const file=await (await request(API+'/files/'+encodeURIComponent(id)+'?supportsAllDrives=true&fields=id,name,mimeType,size,sha256Checksum,parents,trashed,version',{signal})).json();
+  if(file.id!==id)throw Error('云端文件身份不匹配');return file;
+ }
+ function matches(file,parent,name,size,hash){
+  if(!file.id||file.trashed!==false||file.name!==name||!file.parents?.includes(parent)||file.mimeType?.startsWith('application/vnd.google-apps.')||String(file.size)!==String(size)||!hash||file.sha256Checksum?.toLowerCase()!==hash.toLowerCase())throw Error('云端文件尚未完整同步或校验不一致，保留原件，稍后重试');
+  return {...file,parent};
+ }
+ async function verifyFileById(id,parent,name,size,hash,signal){return matches(await metadata(id,signal),parent,name,size,hash);}
+ async function findNamed(parent,name,signal){
+  const quote=s=>String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'");
+  const query=new URLSearchParams({q:`'${quote(parent)}' in parents and name = '${quote(name)}' and trashed = false`,fields:'files(id),nextPageToken',pageSize:'100',supportsAllDrives:'true',includeItemsFromAllDrives:'true'});
+  const result=await (await request(API+'/files?'+query,{signal})).json();
+  if(!Array.isArray(result.files))throw Error('云端查询未返回有效文件列表，保留原件');
+  if(!result.files.length&&!result.nextPageToken)throw Error(`等待 Google Drive 上传：云端尚未找到“${name}”，原件保留`);
+  if(result.nextPageToken||result.files.length!==1)throw Error(`云端存在同名冲突：“${name}”（至少${result.files.length}项），原件保留`);
+  return metadata(result.files[0].id,signal);
+ }
+ async function findFolder(parent,name,signal){
+  const folder=await findNamed(parent,name,signal);
+  if(folder.trashed!==false||folder.mimeType!=='application/vnd.google-apps.folder'||folder.name!==name||!folder.parents?.includes(parent))throw Error('云端配套资源文件夹不匹配');
+  return folder;
+ }
+ async function verifyFolder(id,name,signal){const folder=await metadata(id,signal);if(folder.trashed!==false||folder.name!==name||folder.mimeType!=='application/vnd.google-apps.folder')throw Error('云端批次文件夹不匹配');return folder;}
+ async function verifyFile(parent,name,size,hash,signal){return matches(await findNamed(parent,name,signal),parent,name,size,hash);}
+ return {status,configure,login,disconnect,createFolder,upload,verifyFile,verifyFileById,verifyFolder,findFolder};
 }
 module.exports={createGoogleDrive,validateClient,digest};

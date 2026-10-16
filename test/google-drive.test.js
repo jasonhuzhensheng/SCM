@@ -21,7 +21,7 @@ const {createGoogleDrive,validateClient,digest}=require('../main-lib/google-driv
    return Response.json({id:'folder1',webViewLink:'https://drive.google.com/drive/folders/folder1'});
   };
   const drive=createGoogleDrive({userDataDir:root,safeStorage:vault,fetchImpl,openExternal:async raw=>{
-   const u=new URL(raw);assert.equal(u.searchParams.get('scope'),'https://www.googleapis.com/auth/drive.file');assert.equal(u.searchParams.get('code_challenge_method'),'S256');
+   const u=new URL(raw);assert.equal(u.searchParams.get('scope'),'https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.metadata.readonly');assert.equal(u.searchParams.get('code_challenge_method'),'S256');
    const cb=new URL(u.searchParams.get('redirect_uri'));cb.search=new URLSearchParams({state:'wrong',code:'fake'});assert.equal((await fetch(cb)).status,400);
    cb.search=new URLSearchParams({state:u.searchParams.get('state'),code:'fake'});assert.equal((await fetch(cb)).status,200);
   }});

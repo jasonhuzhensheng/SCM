@@ -1,0 +1,11 @@
+'use strict';
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),ts=require('typescript');
+const source=fs.readFileSync(path.join(__dirname,'../src/simple/photosLibraryView.ts'),'utf8'),ctx={exports:{}};vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText,ctx);
+const pick=ctx.exports.photosLibrarySelection,u='C2484340-19D9-4ABB-A615-1A1B572CFB8E',root='/A.photoslibrary';
+const sources=[`${root}/resources/derivatives/C/${u}_1.jpeg`,`${root}/originals/C/${u}.mov`,`${root}/originals/C/${u}.HEIC`,`${root}/resources/renders/C/${u}_1_2.jpeg`,`${root}/resources/cpl/cloudsync.noindex/storage/filecache/abc/cpl123.mov`,`/exports/${u}.jpeg`,`/B.photoslibrary/originals/C/${u}.HEIC`,`${root}/internal/something.jpeg`];
+const r=pick(sources.map((_,i)=>String(i)),sources);assert.deepEqual(Array.from(r.selected),[2,5,6]);assert.equal(r.internal,3);assert.equal(r.grouped,2);
+assert.deepEqual(Array.from(pick(['invalid',null,'valid'],['','',`/plain.jpg`]).selected),[0,2],'original ordinals retained');
+assert.deepEqual(Array.from(pick(['render'],[sources[3]]).selected),[0],'render-only asset remains visible');
+assert.deepEqual(Array.from(pick(['external1','external2'],['/one/a.jpg','/two/a.jpg']).selected),[0,1],'ordinary files never deduplicated by name');
+assert.deepEqual(Array.from(pick(['unknown-original'],[root+'/originals/C/legacy-name.jpg']).selected),[0],'unknown original names must never be hidden');
+console.log('PASS: Photos cache filtering, same-asset grouping, independent libraries, exported files, ordinal alignment and render-only preservation');

@@ -34,6 +34,10 @@ if (!userDataDir) {
 initLibraryStore({ userDataDir });
 initCategoryOverrides({ dataDir: path.join(userDataDir, "library") });
 
+let queryCache;
+function getQueryCache() {
+ return queryCache ||= require("./query-result-cache.js").openQueryResultCache(path.join(userDataDir,"library","query-results.sqlite"));
+}
 let cachedGen = null;
 function ensureLibrary(gen) {
 	if (cachedGen === gen) return;
@@ -56,6 +60,14 @@ if (process.parentPort) {
 			process.exit(0);
 			return;
 		}
+        if (msg.type === "query-cache-lookup" || msg.type === "query-cache-store") {
+            try {
+                const cache=getQueryCache();
+                const results=msg.type === "query-cache-lookup" ? cache.lookup(msg.query,msg.context) : cache.store(msg.query,msg.context,msg.result);
+                post({id:msg.id,ok:true,results});
+            } catch (error) { post({id:msg.id,ok:false,error:error.message}); }
+            return;
+        }
 		if (msg.type === "sync-live") {
 			try {
 				if (msg.live.offset === 0) { resetLibraryCaches(); cachedGen = null; }

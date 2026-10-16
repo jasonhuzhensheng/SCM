@@ -1,0 +1,8 @@
+import { useEffect, useState } from "react";
+export function DeletePerformanceSettings(){
+ const [value,setValue]=useState("10"),[ready,setReady]=useState(false),[busy,setBusy]=useState(false),[message,setMessage]=useState("");
+ useEffect(()=>{let active=true;if(!window.memories?.getDeleteConcurrency){setMessage("请在更新后的桌面版设置");return;}void window.memories.getDeleteConcurrency().then(n=>{if(active){setValue(String(n));setReady(true);}}).catch(()=>{if(active)setMessage("读取失败，请重新打开设置");});return()=>{active=false;};},[]);
+ const concurrency=Number(value),valid=value.trim()!==""&&Number.isInteger(concurrency)&&concurrency>=1&&concurrency<=100;
+ async function save(count:number){setBusy(true);setMessage("");try{const saved=await window.memories.setDeleteConcurrency(count);setValue(String(saved));setMessage(`已保存：最多同时校验 ${saved} 个。当前删除任务从下一轮检查起生效。`);}catch{setMessage("保存失败，请重试");}finally{setBusy(false);}}
+ return <div className="settings-section"><h3>删除校验性能</h3><p>异步核对原件，整批核验通过后统一请求系统删除。连拍和锁定素材继续保留。</p><label className="field-label" htmlFor="delete-check-concurrency">同时校验文件数</label><input id="delete-check-concurrency" className="settings-select" type="number" min={1} max={100} step={1} value={value} disabled={!ready||busy} onChange={e=>setValue(e.target.value)}/><p className="setting-note">默认 10，可设 1–100。保存后，当前删除任务从下一轮检查起使用新值；正在检查的文件会先完成。并发越高，CPU、内存和磁盘负载越大，卡顿时调低。</p>{!valid&&<p role="alert">请输入 1–100 的整数。</p>}<button className="primary-button" disabled={!ready||busy||!valid} onClick={()=>void save(concurrency)}>保存校验设置</button>{" "}<button className="secondary-button" disabled={!ready||busy} onClick={()=>void save(10)}>恢复默认 10</button>{message&&<p role="status">{message}</p>}</div>;
+}

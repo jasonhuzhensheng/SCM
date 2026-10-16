@@ -1,3 +1,16 @@
+export interface ResourceStatus {
+ version: number; acknowledged: boolean; performance: ImportPerformance;
+ pending: {count: number; sourceBytes: number | null} | null;
+ plan: { count: number | null; sourceBytes: number | null; indexBytes: number; reserveBytes: number; freeBytes: number | null; deficitBytes: number | null; recommendedExternalBytes: number | null; estimated: boolean };
+ gate: { freeBytes: number | null; reservedBytes: number; reserveBytes: number; waitingReason: string };
+ target: { uuid: string; directory: string; online: boolean; freeBytes: number | null; error?: string } | null;
+}
+export interface ImportPerformance {
+ mode: "auto" | "economy" | "manual";
+ configured: number; recommended: number; effective: number; safeMax: number;
+ cores: number; memoryGiB: number; max: number; default: number; active: number | null;
+}
+export interface TransferProgress { verificationConcurrency?:number; activeVerifications?:number; moved?:number; issues?:Array<{filename:string;error:string;retained?:boolean}>; taskId?:string; releaseNames?:string[]; cloudVerified?:number; localReleased?:number; done:number; total:number; filename:string; percent:number; phase?:string; copied?:number; verified?:number; transferredBytes?:number; totalBytes?:number; currentBytes?:number; currentTotal?:number; overallPercent?:number; }
 export interface PersonFace {
  id:string;key:string;assetID:string;filename:string;video:boolean;time:number;
  bounds:{x:number;y:number;width:number;height:number};
@@ -44,6 +57,7 @@ export interface WatchedFolder {
 }
 
 export type ImportPhase =
+    | "waiting"
 	| "scanning"
 	| "copying"
 	| "embedding"
@@ -146,6 +160,8 @@ export type StatusPayload =
 	  }
 	| {
 			type: "import";
+            pendingJobs?: number;
+            waitingReason?: string;
             paused?: boolean;
             active?: boolean;
 			phase: ImportPhase;
@@ -451,11 +467,13 @@ interface MemoriesBridge {
  peopleFaceThumbnail(id: string, key: string): Promise<string>;
  peopleRename(id: string, name: string): Promise<PeopleStatus>;
  deletionSpaceHistory(): Promise<{totals:{trashedCount:number;trashedBytes:number}}>;
- fileTasks(): Promise<Array<{id:string;kind:string;status:string;done:number;total:number;error?:string;mode?:"copy"|"move";filename?:string;destination?:string;repairOriginals?:boolean;succeeded?:number;failed?:number}>>;
+ revealFileTask(id:string): Promise<void>;
+ fileTasks(): Promise<Array<{checkedCount?:number;deleteSubmitted?:boolean;verificationConcurrency?:number;activeVerifications?:number;id:string;kind:string;status:string;done:number;total:number;error?:string;mode?:"copy"|"move";filename?:string;destination?:string;repairOriginals?:boolean;succeeded?:number;failed?:number;skipped?:number;cloudVerifiedMove?:boolean;progress?:TransferProgress}>>;
  pauseFileTask(id:string): Promise<unknown>;
  resumeFileTask(id:string): Promise<unknown>;
  drivePause(): Promise<{ok:boolean}>;
  cancelFileTask(id:string): Promise<unknown>;
+ restoreLockedPhotos(names:string[], checkOnly?:boolean): Promise<{ok:boolean;error?:string;filenames?:string[];restored?:string[];verified?:string[];pending?:string[];alreadyActive?:string[]}>;
  deleteBatch(entries:Array<{filename:string;original:boolean;duplicateKeeper?:string}>): Promise<{ok:boolean;error?:string;canceled?:boolean;results?:Array<{filename:string;ok:boolean;error?:string}>}>;
  taskCheckpoint(key: "quality" | "ai-origin", value?: { pending: boolean; names: string[]; forced: string[] }): Promise<{ pending: boolean; names: string[]; forced: string[] } | null>;
  photoQuality(names: string[], options?: { cachedOnly?: boolean; force?: boolean }): Promise<Record<string, { score?: number; error?: string }>>;
@@ -470,9 +488,9 @@ interface MemoriesBridge {
 	driveConfigure(): Promise<{ ok: boolean; configured?: boolean; connected?: boolean; canceled?: boolean; error?: string }>;
 	driveLogin(): Promise<{ ok: boolean; connected?: boolean; error?: string }>;
 	driveDisconnect(): Promise<{ ok: boolean; connected?: boolean; error?: string }>;
-	driveTransfer(options: { filenames: string[]; mode: "copy" | "move"; folderName: string; destination?: "folder"; folderToken?: string }): Promise<{ ok: boolean; error?: string; paused?: boolean; canceled?: boolean; folderUrl?: string; folderPath?: string; results?: { filename: string; ok: boolean; error?: string; url?: string }[] }>;
+	driveTransfer(options: { filenames: string[]; mode: "copy" | "move"; folderName: string; searchQuery?: string; destination?: "folder"; folderToken?: string }): Promise<{ ok: boolean; error?: string; staleFilenames?: string[]; paused?: boolean; canceled?: boolean; folderUrl?: string; folderPath?: string; results?: { filename: string; ok: boolean; error?: string; url?: string; skipped?: boolean }[] }>;
 	driveCancel(): Promise<{ ok: boolean }>;
-	onDriveProgress(callback: (progress: { done: number; total: number; filename: string; percent: number }) => void): () => void;
+	onDriveProgress(callback: (progress: TransferProgress) => void): () => void;
 	translateSearch(text: string): Promise<{ ok: true; text: string } | { ok: false; error: string }>;
 	similarPhotos(filename: string): Promise<{ ok: boolean; error?: string; matches?: {filename: string; score: number}[] }>;
 	embedQuery(text: string): Promise<number[] | null>;
@@ -546,9 +564,16 @@ interface MemoriesBridge {
 	>;
 	/** Background transcription state (mirrors enrich-state). */
 	getTranscribeState?(): Promise<StatusPayload | null>;
+	queueImport(paths?: string[]): Promise<{queued: true; jobId: string; selected: number; pendingJobs: number; paused: boolean} | null>;
 	importPaths(paths: string[]): Promise<ImportResult>;
 	pickPhotos(): Promise<ImportResult | null>;
  getImportState(): Promise<Extract<StatusPayload, {type:"import"}>>;
+ getResourceStatus(): Promise<ResourceStatus>;
+ setResourceMode(mode: "auto" | "economy" | "manual"): Promise<ResourceStatus>;
+ acknowledgeResourceSetup(): Promise<boolean>;
+ chooseStorageTarget(): Promise<ResourceStatus>;
+ getImportPerformance(): Promise<ImportPerformance>;
+ setImportProcesses(value: number): Promise<ImportPerformance>;
  setImportPaused(paused:boolean): Promise<Extract<StatusPayload, {type:"import"}>>;
  applePhotosStatus(): Promise<ApplePhotosStatus>;
  applePhotosConnect(): Promise<ApplePhotosStatus>;
@@ -566,7 +591,10 @@ interface MemoriesBridge {
 	/** Open a library file in the OS default app (full-file playback for
 	 *  searchable-only video containers the in-app player cannot demux). */
 	openExternal?(filename: string): Promise<{ ok: boolean; error?: string }>;
-	getAssetLocks(): Promise<string[]>;
+	burstList(): Promise<{items: {filename:string;source:string;group:string}[];errors:string[]}>;
+	getDeleteConcurrency(): Promise<number>;
+ setDeleteConcurrency(value:number): Promise<number>;
+ getAssetLocks(): Promise<string[]>;
 		setAssetLocks(names: string[], locked: boolean): Promise<{ok: boolean; filenames?: string[]; error?: string}>;
 		getFileLock(): Promise<boolean>;
 	setFileLock(locked: boolean): Promise<{ok: boolean; locked?: boolean; error?: string}>;

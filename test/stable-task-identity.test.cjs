@@ -1,0 +1,12 @@
+const assert=require('assert/strict'),{context,resume}=require('../main-lib/stable-task-identity');
+const stat=dev=>({dev,ino:22,size:300,mtimeMs:400,ctimeMs:500,isFile:()=>true});
+const proof={version:1,volumeUUID:'same-disk',path:'/disk/photo.png'};
+const make=()=>({id:'job',done:0,payload:{rows:[{filename:'photo.png',source:'/disk/photo.png',originalSignature:'1:22:300:400:500',signature:'1:22:300:400:500',stableIdentity:{original:proof,cache:proof}}]},photoBatch:{confirmed:true,entries:[]}});
+(async()=>{let calls=0,writes=0;const deps={stat:async()=>stat(9),realpath:async p=>p,volumeIdentity:async p=>{calls++;return {uuid:'same-disk',directory:p}}};const job=make();const r=await resume(job,()=>writes++,deps);assert.equal(r.rebound,2);assert.equal(job.payload.rows[0].originalSignature,'9:22:300:400:500');assert.equal(calls,1);assert.equal(writes,1);
+ const second=await resume(job,()=>writes++,{...deps,stat:async()=>stat(11)});assert.equal(second.rebound,2);assert.equal(job.payload.rows[0].signature,'11:22:300:400:500');
+ for(const bad of [{...deps,volumeIdentity:async()=>({uuid:'other-disk'})},{...deps,stat:async()=>({...stat(9),size:301})},{...deps,realpath:async()=>'/replacement/photo.png'}]){const j=make(),before=JSON.stringify(j);await assert.rejects(resume(j,()=>{throw Error('must not save')},bad),e=>e.retryable===false);assert.equal(JSON.stringify(j),before)}
+ const submitted=make();submitted.photoBatch.entries=[{index:0,journal:{photos:{requested:true}}}];const before=JSON.stringify(submitted);await resume(submitted,()=>{throw Error('must not save')},{stat:()=>{throw Error('must not inspect submitted source')}});assert.equal(JSON.stringify(submitted),before);
+ for(const key of ['selectionDeleteBatch','photoBatch']){const j=make();j[key]={requested:true,entries:[{index:0,journal:{}}]};assert.equal((await resume(j,()=>{throw Error('no save')},{stat:()=>{throw Error('no reads')}})).rebound,0)}
+ const legacy=make();delete legacy.payload.rows[0].stableIdentity;assert.equal((await resume(legacy,()=>{},deps)).rebound,0);
+ const capture=await context(deps).capture('/disk/photo.png',stat(9),'/disk/photo.png',stat(9));assert.equal(capture.original.volumeUUID,'same-disk');assert.equal(capture.cache.path,'/disk/photo.png');
+ console.log('PASS repeated reboot rebind, volume UUID protection, changed bytes metadata/path rejection, submitted receipt untouched, legacy fail-safe, capture');})().catch(e=>{console.error(e);process.exitCode=1});

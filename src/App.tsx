@@ -59,6 +59,7 @@ interface ImportProgress {
 }
 
 const PHASE_LABELS: Record<ImportPhase, string> = {
+ waiting: "等待添加",
 	scanning: "Scanning files",
 	copying: "Copying",
 	embedding: "Analyzing with AI",

@@ -392,7 +392,7 @@ async function extractFrameAt(
 	const slowTimeoutMs =
 		Number(opts?.slowTimeoutMs) > 0 ? Number(opts.slowTimeoutMs) : 150000;
 	const frameArgs = (seekBefore) => {
-		const args = ["-y"];
+		const args = ["-y", "-threads", "1", "-filter_threads", "1"];
 		if (seekBefore) args.push("-ss", atSeconds.toFixed(3), "-i", filePath);
 		else args.push("-i", filePath, "-ss", atSeconds.toFixed(3));
 		args.push("-frames:v", "1", "-q:v", "3");
@@ -457,7 +457,7 @@ async function extractFrameRaw(ffmpeg, filePath, atSeconds, width, opts = {}) {
 		Number(opts?.slowTimeoutMs) > 0 ? Number(opts.slowTimeoutMs) : 150000;
 	const scale = width > 224 ? `scale='min(${width},iw)':-2` : "scale=224:224";
 	const frameArgs = (seekBefore) => {
-		const args = ["-y"];
+		const args = ["-y", "-threads", "1", "-filter_threads", "1"];
 		if (seekBefore) args.push("-ss", atSeconds.toFixed(3), "-i", filePath);
 		else args.push("-i", filePath, "-ss", atSeconds.toFixed(3));
 		args.push("-frames:v", "1", "-vf", scale);
@@ -539,13 +539,7 @@ async function extractFrames(ffmpeg, filePath) {
 	// Independent ffmpeg spawns — run them concurrently. Each keeps its own
 	// fast/slow-seek fallback; a failure still fails the whole extraction.
 	const out = new Array(timestamps.length);
-	await Promise.all(
-		timestamps.map((atSeconds, i) =>
-			extractFrameRaw(ffmpeg, filePath, atSeconds, 224).then((frame) => {
-				out[i] = frame;
-			}),
-		),
-	);
+	for (let i = 0; i < timestamps.length; i++) out[i] = await extractFrameRaw(ffmpeg, filePath, timestamps[i], 224);
 	return out;
 }
 

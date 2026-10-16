@@ -1,0 +1,52 @@
+"use strict";
+const assert = require("node:assert/strict");
+const fs = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
+const { createMetadataCache, closeMetadataCaches } = require("../main-lib/metadata-cache");
+const { createDeviceIndex } = require("../main-lib/capture-device");
+const { createPhotoQualityIndex } = require("../main-lib/photo-quality");
+(async () => {
+ const root = await fs.mkdtemp(path.join(os.tmpdir(), "metadata-db-"));
+ try {
+  const name = "photo.jpg", file = path.join(root, name);
+  await fs.writeFile(file, "test photo");
+  const stat = await fs.stat(file);
+  const device = { brand: "索尼", model: "A7", status: "confirmed" };
+  const legacy = JSON.stringify({ [name]: { key: `${stat.size}:${stat.mtimeMs}`, device } });
+  const devicePath = path.join(root, "capture-devices.json");
+  await fs.writeFile(devicePath, legacy);
+  const version = "vision-revision1-1600-v1";
+  const qualityPath = path.join(root, "photo-quality.json");
+  await fs.writeFile(qualityPath, JSON.stringify({ version, records: { [name]: { key: `${version}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}:${stat.ino}`, score: .8 } } }));
+  const unexpected = () => { throw Error("must reuse migrated cache"); };
+  const readDevice = createDeviceIndex({ directory: root, cachePath: devicePath, metadata: unexpected, videoMetadata: unexpected });
+  const readQuality = createPhotoQualityIndex({ directory: root, cachePath: qualityPath, evaluate: unexpected });
+  const [devices, quality] = await Promise.all([readDevice([name]), readQuality([name])]);
+  assert.deepEqual(devices[name], device);
+  assert.equal(quality[name].score, .8);
+  assert.equal(await fs.readFile(devicePath, "utf8"), legacy, "migration preserves original JSON");
+  const cache = createMetadataCache({ cachePath: qualityPath, kind: "quality", version });
+  await cache.put([{ name, value: { key: "new", score: .9 } }]);
+  await assert.rejects(cache.put([{ name, value: { key: "wrong", score: .1 } }, { name: "b", value: { key: "bad", score: 9 } }]), /Invalid/);
+  assert.equal((await cache.get([name]))[name].score, .9, "invalid batch must not commit partially");
+  await closeMetadataCaches();
+  assert.equal((await cache.get([name]))[name].score, .9, "reopening must not overwrite newer DB rows with legacy JSON");
+  const otherVersion = createMetadataCache({ cachePath: qualityPath, kind: "quality", version: "future" });
+  assert.equal(Object.keys(await otherVersion.get([name])).length, 0);
+  await cache.put([{ name: "__proto__", value: { key: "safe", score: .2 } }]);
+  assert.equal((await cache.get(["__proto__"]))["__proto__"].score, .2);
+  await assert.rejects(cache.get(["../outside"]), /Invalid/);
+  // Changing during extraction must not publish an old-signature device record.
+  const moving = createDeviceIndex({ directory: root, cachePath: path.join(root, "changing.json"), metadata: async () => { await fs.appendFile(file, "changed"); return {}; } });
+  assert.equal((await moving([name]))[name].status, "error");
+  assert.equal(Object.keys(await moving([name], { cachedOnly: true })).length, 0);
+  await closeMetadataCaches();
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(path.join(root, "metadata-cache.sqlite"));
+  assert.equal(db.prepare("PRAGMA integrity_check").get().integrity_check, "ok");
+  assert.equal(db.prepare("SELECT count(*) n FROM cache_entries WHERE namespace LIKE 'device:%'").get().n, 1);
+  db.close();
+  console.log("PASS: shared SQLite, legacy migration, restart, version isolation, atomic errors, signatures, path/prototype safety and integrity");
+ } finally { await closeMetadataCaches(); await fs.rm(root, { recursive: true, force: true }); }
+})().catch(error => { console.error(error); process.exitCode = 1; });

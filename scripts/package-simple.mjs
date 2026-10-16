@@ -15,14 +15,17 @@ if (!existsSync("dist/index.html")) throw new Error("Run npm run build first.");
 const inputAsar = join(source, "Contents/Resources/app.asar");
 const installed = JSON.parse(extractFile(inputAsar, "package.json").toString());
 const project = JSON.parse(readFileSync("package.json", "utf8"));
-if (installed.version !== project.version) throw new Error(`Runtime version mismatch: ${installed.version} vs ${project.version}`);
+// Product releases have independent versions; runtime compatibility follows Electron.
+if (installed.devDependencies?.electron !== project.devDependencies?.electron) throw new Error("Electron runtime version mismatch");
+const { reserve, stamp } = await import("./release-version.cjs");
+const release = reserve();
 const stage = mkdtempSync(join(tmpdir(), "scm-simple-package-"));
 try {
 	execFileSync("ditto", ["--norsrc", "--noextattr", source, output]);
 	extractAll(inputAsar, stage);
 	// Preserve the runtime's package identity and dependency metadata, updating
 	// only branding. main.js pins userData to the existing scm directory.
-	writeFileSync(join(stage, "package.json"), JSON.stringify({ ...installed, productName: project.build.productName, description: project.description }, null, 2) + "\n");
+	writeFileSync(join(stage, "package.json"), JSON.stringify({ ...installed, version: release.version, productName: project.build.productName, description: project.description }, null, 2) + "\n");
  const removed = removePackagedModels(stage);
  const unpacked = join(output, "Contents/Resources/app.asar.unpacked");
  if (existsSync(unpacked)) removePackagedModels(unpacked);
@@ -31,13 +34,14 @@ try {
 	cpSync(resolve("main.js"), join(stage, "main.js"));
 	cpSync(resolve("preload.js"), join(stage, "preload.js"));
 	for (const file of ["indexer.js", "index-performance.js", "models.js", "embeddinggemma2.js"]) cpSync(resolve("indexer", file), join(stage, "indexer", file));
-	for (const file of ["photo-deletion.js", "file-tasks.js", "ai-origin.js", "duplicate-cleanup.js", "photo-quality.js", "import-pacer.js", "face-thumbnails.js", "face-groups.js", "capture-device.js", "asset-locks.js", "failed-imports.js", "import-control.js", "copy-cleanup.js", "reference-storage.js", "apple-photos.js", "live-search-index.js", "rank-worker.js", "index-startup.js", "library-store.js", "photo-location.js", "map-tiles.js", "folder-transfer.js", "similar-photos.js", "rank-search.js", "qr-search.js", "detection-index.js", "detection-worker.js"]) cpSync(resolve("main-lib", file), join(stage, "main-lib", file));
+	for (const file of ["transfer-folder-info.js", "stable-task-identity.js", "task-volume-identity.js", "telemetry.js", "adaptive-resources.js", "metadata-cache.js", "metadata-cache-worker.js", "metadata-budget.js", "query-result-cache.js", "search-result-cache.js", "metadata-catalog.js", "index-checkpoint.js", "import-performance.js", "photo-deletion.js", "file-tasks.js", "task-conflicts.js", "ai-origin.js", "duplicate-cleanup.js", "photo-quality.js", "import-pacer.js", "face-thumbnails.js", "face-groups.js", "capture-device.js", "asset-locks.js", "failed-imports.js", "import-control.js", "copy-cleanup.js", "reference-storage.js", "apple-photos.js", "live-search-index.js", "rank-worker.js", "index-startup.js", "library-store.js", "photo-location.js", "map-tiles.js", "folder-transfer.js", "local-copy-first.js", "transfer-progress.js", "cloud-batch.js", "similar-photos.js", "rank-search.js", "qr-search.js", "detection-index.js", "detection-worker.js"]) cpSync(resolve("main-lib", file), join(stage, "main-lib", file));
 	cpSync(resolve("main-lib/google-drive.js"), join(stage, "main-lib/google-drive.js"));
 	cpSync(resolve("main-lib/search-translation.js"), join(stage, "main-lib/search-translation.js"));
 	cpSync(resolve("main-lib/llm/server.js"), join(stage, "main-lib/llm/server.js"));
 	// Retain original public assets used by the classic UI (fonts, icons, tour).
 	execFileSync("ditto", ["--norsrc", "--noextattr", resolve("dist"), join(stage, "dist")]);
 	cpSync(resolve("main-lib/native/qr-detector"), join(output, "Contents/Resources/qr-detector"));
+	execFileSync("clang", ["-fobjc-arc", "-O2", "-framework", "Foundation", "-framework", "Photos", resolve("native/restore-locked-photos.m"), "-o", join(output, "Contents/Resources/restore-locked-photos")]);
 	execFileSync("swiftc", ["-O", "-module-cache-path", join(tmpdir(), "fly-photo-swift-cache"), resolve("native/apple-photos.swift"), "-o", join(output, "Contents/Resources/apple-photos-bridge"), "-framework", "Photos", "-framework", "CryptoKit"]);
  execFileSync("swiftc", ["-parse-as-library", "-O", "-module-cache-path", join(tmpdir(), "sayphoto-face-swift-cache"), resolve("native/face-groups.swift"), "-o", join(output, "Contents/Resources/face-groups"), "-framework", "MediaIntelligence", "-framework", "AVFoundation", "-framework", "ImageIO"]);
  execFileSync("swiftc", ["-parse-as-library", "-O", "-module-cache-path", join(tmpdir(), "sayphoto-quality-swift-cache"), resolve("native/photo-quality.swift"), "-o", join(output, "Contents/Resources/photo-quality"), "-framework", "Vision", "-framework", "ImageIO"]);
@@ -75,6 +79,7 @@ for locale,name in [('en','SayPhoto'),('zh_CN','SayPhoto'),('zh_TW','SayPhoto'),
  existing.update(CFBundleDisplayName=name)
  strings.write_bytes(plistlib.dumps(existing))
 `, join(output, "Contents/Info.plist"), hash]);
+	stamp(output, release);
 	// Sign the newly built bundle only. Do not change system Gatekeeper settings.
 	execFileSync("xattr", ["-cr", output]);
 	execFileSync("codesign", ["--force", "--deep", "--sign", "-", output], { stdio: "inherit" });

@@ -13,6 +13,7 @@ const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'scm-scan-test-'));
   fs.mkdirSync(path.join(temp, 'nested'));
   fs.writeFileSync(path.join(temp, 'a.jpg'), 'photo');
   fs.writeFileSync(path.join(temp, 'ignored.txt'), 'text');
+  const photos=path.join(temp,'Test.photoslibrary');fs.mkdirSync(path.join(photos,'resources/derivatives'),{recursive:true});fs.mkdirSync(path.join(photos,'originals/A'),{recursive:true});fs.writeFileSync(path.join(photos,'resources/derivatives/cache.jpg'),'cache');fs.writeFileSync(path.join(photos,'originals/A/original.jpg'),'original');
   fs.writeFileSync(path.join(temp, 'nested', 'b.mp4'), 'video');
   fs.symlinkSync(temp, path.join(temp, 'nested', 'cycle'));
   fs.symlinkSync(path.join(temp, 'a.jpg'), path.join(temp, 'linked.jpg'));
@@ -22,6 +23,7 @@ const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'scm-scan-test-'));
   let release;
   const blocked = new Promise(resolve => { release = resolve; });
   const context = {
+    require: specifier => require("../" + specifier.slice(2)),
     path,
     IMPORT_EXTENSIONS: new Set(['.jpg', '.mp4']),
     fs: { promises: {
@@ -37,6 +39,6 @@ const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'scm-scan-test-'));
   release();
   const files = Array.from(await pending).map(file => path.relative(temp, file)).sort();
   clearInterval(timer);
-  assert.deepEqual(files, ['a.jpg', 'linked.jpg', 'missing.jpg', 'nested/b.mp4']);
+  assert.deepEqual(files, ['Test.photoslibrary/originals/A/original.jpg', 'a.jpg', 'linked.jpg', 'missing.jpg', 'nested/b.mp4']);
   console.log('PASS: asynchronous scan stays responsive; recursion, symlinks, filtering and missing paths preserved');
 })().finally(() => fs.rmSync(temp, { recursive: true, force: true })).catch(error => { console.error(error); process.exitCode = 1; });

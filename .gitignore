@@ -74,3 +74,10 @@ Asset/*
 /main-lib/native/face-groups
 
 /main-lib/native/photo-quality
+
+# Local screenshots, browser traces, and compiled native helpers.
+/.playwright-cli/
+/output/
+/*-preview.png
+/main-lib/native/apple-photos-bridge
+/main-lib/native/qr-detector

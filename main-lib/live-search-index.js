@@ -54,9 +54,15 @@ function liveSearchBatch(rows, offset, end) {
  const limit = 1024 * 1024;
  for (let i = offset; i < end && batch.length < 128; i++) {
   const row = rows[i];
-  const words = row.ocrWords || [];
-  if (!Array.isArray(words) || words.some(word => typeof word !== 'string')) throw Error('Invalid live search OCR');
-  const size = 256 + Buffer.byteLength(row.filename) + words.reduce((n, word) => n + 16 + Buffer.byteLength(word), 0) + 4 * (row.embedding.length + (row.phrase?.length || 0));
+  const sourceWords = row.ocrWords || [];
+  if (!Array.isArray(sourceWords)) throw Error('Invalid live search OCR');
+  // Ranking consumes text only; OCR records also contain bounding boxes.
+  const words = sourceWords.map(word => {
+   const text = typeof word === 'string' ? word : word?.text;
+   if (typeof text !== 'string') throw Error('Invalid live search OCR');
+   return { text };
+  });
+  const size = 256 + Buffer.byteLength(row.filename) + words.reduce((n, word) => n + 16 + Buffer.byteLength(word.text), 0) + 4 * (row.embedding.length + (row.phrase?.length || 0));
   if (size > limit) throw Error('单项搜索数据过大，未发送；请等待索引完成后搜索。');
   if (bytes + size > limit) break;
   batch.push({filename:row.filename,embedding:Float32Array.from(row.embedding),phrase:row.phrase ? Float32Array.from(row.phrase) : null,ocrWords:words});

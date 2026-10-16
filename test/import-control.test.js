@@ -4,7 +4,7 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const {createImportControl}=require('../main-lib/import-control');
 const source=fs.readFileSync(require('node:path').join(__dirname,'../main.js'),'utf8');
-const start=source.indexOf('\tconst BATCH_CONCURRENCY = Math.max(2, INDEXER_POOL_SIZE * 2);');
+const start=source.indexOf('\tconst inflight = new Set();', source.indexOf('async function importPathsInner'));
 const end=source.indexOf('\n\tfor (const p of skippedPaths)',start);
 assert(start>0&&end>start);
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
@@ -13,7 +13,7 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
  const control=createImportControl(state=>states.push(state));
  control.begin();
  const pendingResults=new Map(); let cursor=0;
- const context={fromWatch:false,INDEXER_POOL_SIZE:1,total:5,importControl:control,pendingResults,next:0,uniquePaths:['0','1','2','3','4'],path:require('node:path'),console,
+ const context={resourceGate:{acquire:()=>()=>{},reason:()=>""},managedCopy:false,sourceStats:new Map(),setTimeout,clearTimeout,fromWatch:false,concurrency:2,total:5,importControl:control,pendingResults,next:0,uniquePaths:['0','1','2','3','4'],path:require('node:path'),console,
  posterJobs:[],importPacer:{close(){}},
  processOne:seq=>new Promise(resolve=>jobs.push({seq,resolve})),
  flushResults:()=>{while(pendingResults.has(cursor)){flushed.push(pendingResults.get(cursor));pendingResults.delete(cursor++);}},
@@ -55,6 +55,20 @@ const tick=()=>new Promise(resolve=>setImmediate(resolve));
  assert.deepEqual(flushed,[0,1,2,3]);
  control.setPaused(false);assert.equal(jobs.length,5);
  jobs[4].resolve(4);await automatic;control.finish();
+ // Production concurrency: ten actual file jobs, bounded buffering, one failure
+ // cannot prevent the remaining jobs from settling and being committed.
+ context.concurrency=10;context.total=25;context.next=0;
+ context.uniquePaths=Array.from({length:25},(_,i)=>String(i));
+ pendingResults.clear();cursor=0;jobs=[];flushed=[];control.begin();
+ const ten=vm.runInNewContext('(async()=>{'+source.slice(start,end)+'})()',context);
+ assert.equal(jobs.length,10,'ten independent files start immediately');
+ jobs[1].resolve({kind:'error',filename:'1'});await tick();
+ assert.equal(jobs.length,11,'failure frees a slot without stopping peers');
+ for(let i=2;i<20;i++){jobs[i].resolve(i);await tick();}
+ assert.equal(jobs.length,20,'a slow first file bounds the reorder buffer');
+ jobs[0].resolve(0);await tick();
+ for(let i=20;i<25;i++){jobs[i].resolve(i);await tick();}
+ await ten;assert.equal(flushed.length,25);control.finish();
  const publications=[];const throttled=createImportControl(state=>publications.push(state));
  throttled.begin();
  for(let i=0;i<1000;i++)throttled.update({phase:'embedding',done:i});

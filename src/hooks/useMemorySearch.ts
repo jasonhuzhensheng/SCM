@@ -20,9 +20,7 @@ import type {
 	SetModelResult,
 } from "@/types";
 
-const INDEX_URL = "/memories-index.json";
-const EMBEDDINGS_URL = "/memory-embeddings.bin";
-const PHRASE_EMBEDDINGS_URL = "/memory-phrase-embeddings.bin";
+import { readLibraryIndex, invalidateLibraryIndex } from "@/lib/librarySnapshot";
 const MODELS_URL = "/memories-models.json";
 const SEGMENTS_URL = "/memory-segments.json";
 const SEGMENT_EMBEDDINGS_URL = "/memory-segment-embeddings.bin";
@@ -116,8 +114,7 @@ export function useMemorySearch(filenames: string[]) {
 
 	const [partialSearch, setPartialSearch] = useState<{ indexed: number; total: number; modelId: string } | null>(null);
 	const filenamesRef = useRef<string[]>([]);
-	const embeddingsRef = useRef<Float32Array[] | null>(null);
-	const phraseEmbeddingsRef = useRef<Float32Array[] | null>(null);
+	const indexCountRef = useRef<number | null>(null);
 	// OCR text extracted from each image (visible text on posters/screenshots),
 	// aligned 1:1 with filenames. null/undefined = not OCR'd yet; "" = no
 	// text found. Injected into keyword matching + the hybrid OCR boost.
@@ -144,10 +141,6 @@ export function useMemorySearch(filenames: string[]) {
 	// began before a library-update could resolve AFTER the fresh reload and
 	// clobber it with stale embeddings.
 	const loadGenRef = useRef(0);
-	// Cache the index fingerprint (count, dim, modelId) so redundant
-	// library-updated events (enrichment ticks, OCR ticks) skip the
-	// expensive full re-fetch + parse when nothing changed.
-	const indexFingerprintRef = useRef<string | null>(null);
 
 	useEffect(() => {
 		filenamesRef.current = filenames;
@@ -211,17 +204,10 @@ export function useMemorySearch(filenames: string[]) {
 		const gen = loadGenRef.current;
 		loadPromiseRef.current = (async () => {
 			try {
-				const [indexResp, embBuf, phraseBuf, modelsResp] = await Promise.all([
-					fetch(INDEX_URL).then((r) => r.json()),
-					fetch(EMBEDDINGS_URL)
-						.then((r) => r.arrayBuffer())
-						.catch(() => null),
-					fetch(PHRASE_EMBEDDINGS_URL)
-						.then((r) => r.arrayBuffer())
-						.catch(() => null),
-					fetch(MODELS_URL)
-						.then((r) => (r.ok ? r.json() : null))
-						.catch(() => null),
+				// Ranking runs in the backend; the renderer needs only metadata.
+				const [indexResp, modelsResp] = await Promise.all([
+					readLibraryIndex(),
+					fetch(MODELS_URL).then(r => r.ok ? r.json() : null).catch(() => null),
 				]);
 				const index = indexResp as {
 					images?: string[];
@@ -245,9 +231,7 @@ export function useMemorySearch(filenames: string[]) {
 				// vectors). Commit only after the guard passes.
 				let ocrTexts: (string | null | undefined)[] | null = null;
 				let ocrWordBoxes: (OcrWordBox[] | null | undefined)[] | null = null;
-				let embeddings: Float32Array[] | null = null;
-				let phrases: Float32Array[] | null = null;
-				let dim = 0;
+				const dim = index.dim ?? 0;
 				// OCR text rides the index (model-independent, parallel to
 				// images). Aligned to `ordered` — the same array embeddings
 				// are keyed against — so rankers can trust the index.
@@ -257,57 +241,15 @@ export function useMemorySearch(filenames: string[]) {
 				if (Array.isArray(index.ocrWords)) {
 					ocrWordBoxes = index.ocrWords.slice(0, ordered.length);
 				}
-				if (embBuf && index.dim && index.dim > 0) {
-					const num = new Int32Array(embBuf, 0, 1)[0];
-					const binDim = new Int32Array(embBuf, 4, 1)[0];
-					if (binDim === index.dim && num === ordered.length) {
-						dim = binDim;
-						embeddings = Array.from(
-							{ length: num },
-							(_, i) => new Float32Array(embBuf, 8 + i * binDim * 4, binDim),
-						);
-					} else {
-						console.warn(
-							"[memory-search] memory-embeddings.bin header " +
-								`(${num}x${binDim}) does not match index ` +
-								`(${ordered.length}x${index.dim}); falling back to keyword search`,
-						);
-					}
-				}
-				if (phraseBuf && index.dim && index.dim > 0) {
-					const num = new Int32Array(phraseBuf, 0, 1)[0];
-					const binDim = new Int32Array(phraseBuf, 4, 1)[0];
-					if (binDim === index.dim && num === ordered.length) {
-						phrases = Array.from(
-							{ length: num },
-							(_, i) => new Float32Array(phraseBuf, 8 + i * binDim * 4, binDim),
-						);
-					} else {
-						console.warn(
-							"[memory-search] memory-phrase-embeddings.bin " +
-								`header (${num}x${binDim}) does not match index ` +
-								`(${ordered.length}x${index.dim}); using image-only ranking`,
-						);
-					}
-				}
 				// A library-update may have invalidated + reloaded while this
 				// fetch was in flight — never let a stale load win. Guard
 				// FIRST, commit refs only if this load is still current.
 				if (gen !== loadGenRef.current) return;
 				ocrTextsRef.current = ocrTexts;
-				setOcrWordBoxesByFilename(
-					new Map(
-						ordered.map(
-							(filename, index) =>
-								[filename, ocrWordBoxes?.[index] ?? []] as const,
-						),
-					),
-				);
-				// Record fingerprint so redundant library-updated events skip
-				// the full re-fetch + parse when nothing changed.
-				indexFingerprintRef.current = `${ordered.length}-${dim}-${index.modelId || ""}-${index.ocrRevision ?? 0}`;
-				embeddingsRef.current = embeddings;
-				phraseEmbeddingsRef.current = phrases;
+				const boxes = new Map<string, OcrWordBox[]>();
+				ordered.forEach((name, i) => { if (ocrWordBoxes?.[i]?.length) boxes.set(name, ocrWordBoxes[i]!); });
+				setOcrWordBoxesByFilename(boxes);
+				indexCountRef.current = ordered.length;
 				dimRef.current = dim;
 				const manifest = modelsResp as ModelsManifest | null;
 				if (manifest && Array.isArray(manifest.models)) {
@@ -341,8 +283,7 @@ export function useMemorySearch(filenames: string[]) {
 	const invalidateIndex = useCallback(() => {
 		loadPromiseRef.current = null;
 		loadGenRef.current++;
-		embeddingsRef.current = null;
-		phraseEmbeddingsRef.current = null;
+		indexCountRef.current = null;
 		ocrTextsRef.current = null;
 		setOcrWordBoxesByFilename(new Map());
 		dimRef.current = 0;
@@ -355,25 +296,9 @@ export function useMemorySearch(filenames: string[]) {
 		dispatchStatus({ type: "index/invalidate" });
 	}, []);
 
-	// library-updated fires once per completed import batch (main.js); a
-	// small coalesce window keeps a flurry of batches to one reload.
-	// Before invalidating, check the index fingerprint: enrichment/OCR
-	// ticks broadcast library-updated but the embedding bins haven't
-	// changed, so a cheap HEAD-equivalent (fetch index JSON, compare
-	// count+dim+model) lets us skip the expensive bin re-fetch + parse.
-	const reloadIndex = useCallback(async () => {
-		try {
-			const idxResp = (await fetch(INDEX_URL).then((r) => r.json())) as {
-				images?: string[];
-				dim?: number;
-				modelId?: string;
-				ocrRevision?: number;
-			};
-			const fp = `${idxResp.images?.length ?? 0}-${idxResp.dim ?? 0}-${idxResp.modelId ?? ""}-${idxResp.ocrRevision ?? 0}`;
-			if (fp === indexFingerprintRef.current) return; // same index, skip
-		} catch {
-			/* network/parse error — force reload below */
-		}
+	// Coalesce import/enrichment bursts before fetching, including same-count edits.
+	const reloadIndex = useCallback(() => {
+		invalidateLibraryIndex();
 		invalidateIndex();
 		if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current);
 		reloadTimerRef.current = setTimeout(() => {
@@ -381,6 +306,7 @@ export function useMemorySearch(filenames: string[]) {
 			void loadIndexData();
 		}, 150);
 	}, [invalidateIndex, loadIndexData]);
+	useEffect(() => () => { if (reloadTimerRef.current) clearTimeout(reloadTimerRef.current); }, []);
 
 	// Library changes invalidate the cached index + embeddings so the next
 	// search ranks against the fresh index.
@@ -396,8 +322,8 @@ export function useMemorySearch(filenames: string[]) {
 	// never bails on a stale cache.
 	useEffect(() => {
 		if (
-			embeddingsRef.current !== null &&
-			embeddingsRef.current.length !== filenames.length
+			indexCountRef.current !== null &&
+			indexCountRef.current !== filenames.length
 		) {
 			reloadIndex();
 		}
