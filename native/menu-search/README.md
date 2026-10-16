@@ -15,3 +15,9 @@
 搜索窗口使用三列图片缩略图，点击图片打开原件；文字备注仅显示命中关键词附近的短片段，空查询不显示备注。索引状态独立展示可搜索数、识字检查数/总数及跳过数，并显示进度条与后台状态。
 
 默认搜索现为中文图片向量检索：复用主库CLIP向量，Qwen本机转换中文查询，OCR仅用于命中关键词的短备注。后台仅补缺失向量，每五分钟最多一张，写小工具独立vectors.sqlite。主程序及其任务不会启动。构建后运行scripts/handoff/prepare-menu-semantic.cjs准备本机推理依赖，再打包；当前安装依赖本机/opt/homebrew/bin/node，不是跨机免依赖发行包。
+
+## 共享搜索更新（主程序1.0.37 / 小工具1.0.38）
+
+主程序和小工具采用两步确认协议：先检查支持，再由小工具确认启动搜索。主程序接手后等待同一份结果，不再因750ms未返回而重复启动本地模型。并发相同查询合并；没有主程序或旧版服务不支持协议时走本地搜索。确认启动后断线，只有确认主进程已退出才自动回退；主进程仍在运行时提示重试，避免再次计算。准备阶段取消不会开始搜索，已开始的底层计算不承诺强制中止。
+
+回归：`node test/menu-search-service.test.cjs`、`node test/menu-search-fallback.test.cjs`、`node test/shared-search-owner-exit.test.cjs`、`node test/shared-search-performance.test.cjs`。最后一项使用模拟耗时，不是照片模型跑分。

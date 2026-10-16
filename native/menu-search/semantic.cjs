@@ -6,7 +6,6 @@ const serverMode=process.argv[2]==='--server';
 let request={},output;
 let snapshot=null,loadedText=null;
 const assetRows=require('./sqlite-rows-cache.cjs').createRowsCache();
-let mainBusyUntil=0;
 const queryVectors=new Map();
 const {vectorNorm,updateRow}=require('./vector-norms.cjs');
 async function release(){assetRows.close();await imageSession.release();if(loadedText){await loadedText.textModel.dispose();loadedText=null;}snapshot=null;queryVectors.clear();}
@@ -35,8 +34,7 @@ let imageThreadCount=1;
 const imageSession=require('./image-session.cjs').createImageSession(async()=>{const t=await models();return t.pipeline('image-feature-extraction',repo,{...opts,session_options:{...opts.session_options,intraOpNumThreads:imageThreadCount}})});
 async function loadText(){if(!loadedText){const t=await models();loadedText={tokenizer:await t.AutoTokenizer.from_pretrained(repo,{local_files_only:true}),textModel:await t.CLIPTextModelWithProjection.from_pretrained(repo,opts)};}return loadedText;}
 async function mainSearch(query,mode,ready=false){
- if(!mode&&Date.now()<mainBusyUntil)return null;
- return new Promise((resolve,reject)=>{const socket=net.createConnection(path.join(root,'main-search.sock'));let data='',settled=false;const finish=(err,r)=>{if(settled)return;settled=true;socket.destroy();err?reject(err):resolve(r)};socket.setTimeout(mode?45000:(ready?250:750),()=>{if(!mode)mainBusyUntil=Date.now()+30000;finish(null,null)});socket.on('error',e=>['ENOENT','ECONNREFUSED'].includes(e.code)?finish(null,null):finish(e));socket.on('connect',()=>socket.write(JSON.stringify({query,mode})+'\n'));socket.on('data',chunk=>{data+=chunk;if(data.length>32*1024*1024)return finish(Error('搜索结果过大'));if(data.includes('\n')){try{finish(null,JSON.parse(data.split('\n')[0]))}catch(e){finish(e)}}});socket.on('end',()=>{if(!settled)finish(Error('主程序搜索连接已关闭'))});});
+ return require('./main-search-client.cjs').mainSearch(path.join(root,'main-search.sock'),query,mode,ready);
 }
 async function run(){
  if(request.mode!=='fill')await imageSession.release();
